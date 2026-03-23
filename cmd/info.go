@@ -28,7 +28,7 @@ func RunSub() error {
 	}
 	subPort := meta.SubPort
 	if subPort == 0 {
-		subPort = 20032
+		subPort = 20033
 	}
 	fmt.Printf("订阅地址: https://%s:%d/sub/hz-office\n\n", meta.Domain, subPort)
 

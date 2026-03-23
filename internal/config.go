@@ -1,6 +1,8 @@
 package internal
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -16,7 +18,96 @@ const (
 func ConfigPath() string   { return filepath.Join(DeployDir, "config.json") }
 func MetadataPath() string { return filepath.Join(DeployDir, "metadata.json") }
 
+// --- Node roles ---
+
+type NodeRole string
+
+const (
+	RoleClient  NodeRole = "client"
+	RoleEntry   NodeRole = "entry"
+	RoleTransit NodeRole = "transit"
+	RoleExit    NodeRole = "exit"
+)
+
+func (r NodeRole) Valid() bool {
+	switch r {
+	case RoleClient, RoleEntry, RoleTransit, RoleExit:
+		return true
+	}
+	return false
+}
+
+// --- Metadata v2 ---
+
+type InboundMeta struct {
+	Tag       string `json:"tag"`
+	Protocol  string `json:"protocol"`             // vless, hysteria2, shadowsocks, socks
+	Port      int    `json:"port"`
+	Transport string `json:"transport"`             // tcp, udp
+	PublicKey string `json:"public_key,omitempty"`   // vless reality
+	ShortID   string `json:"short_id,omitempty"`     // vless reality
+	UUID      string `json:"uuid,omitempty"`         // vless
+	Password  string `json:"password,omitempty"`     // hy2, ss
+	ObfsPass  string `json:"obfs_password,omitempty"` // hy2 salamander
+}
+
+type UpstreamMeta struct {
+	Name     string `json:"name"`
+	Address  string `json:"address"`           // domain or IP
+	SubURL   string `json:"sub_url,omitempty"` // subscription URL for fetching inbound info
+	Priority int    `json:"priority"`          // lower = preferred
+}
+
+type BWGConfig struct {
+	VEID   string `json:"veid"`
+	APIKey string `json:"api_key"`
+}
+
 type Metadata struct {
+	Version int      `json:"version"`
+	Role    NodeRole `json:"role"`
+	NodeID  string   `json:"node_id"`
+	Name    string   `json:"name,omitempty"`
+	Domain  string   `json:"domain,omitempty"`
+
+	Inbounds  []InboundMeta  `json:"inbounds,omitempty"`
+	Upstreams []UpstreamMeta `json:"upstreams,omitempty"`
+
+	SubPort  int    `json:"sub_port,omitempty"`
+	APIToken string `json:"api_token,omitempty"`
+
+	BWG *BWGConfig `json:"bwg,omitempty"`
+}
+
+// LoadMetadata loads metadata.json with automatic v0→v2 migration.
+func LoadMetadata() (*Metadata, error) {
+	data, err := os.ReadFile(MetadataPath())
+	if err != nil {
+		return nil, fmt.Errorf("read metadata: %w", err)
+	}
+
+	// Probe version field
+	var probe struct {
+		Version int `json:"version"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return nil, fmt.Errorf("parse metadata: %w", err)
+	}
+
+	if probe.Version >= 2 {
+		var m Metadata
+		if err := json.Unmarshal(data, &m); err != nil {
+			return nil, fmt.Errorf("parse metadata v2: %w", err)
+		}
+		return &m, nil
+	}
+
+	// v0 migration
+	return migrateV0(data)
+}
+
+// metadataV0 is the legacy flat structure.
+type metadataV0 struct {
 	Domain    string `json:"domain"`
 	VlessPort int    `json:"vless_port"`
 	Hy2Port   int    `json:"hy2_port"`
@@ -26,16 +117,60 @@ type Metadata struct {
 	SubPort   int    `json:"sub_port"`
 }
 
-func LoadMetadata() (*Metadata, error) {
-	data, err := os.ReadFile(MetadataPath())
+func migrateV0(data []byte) (*Metadata, error) {
+	var v0 metadataV0
+	if err := json.Unmarshal(data, &v0); err != nil {
+		return nil, fmt.Errorf("parse metadata v0: %w", err)
+	}
+
+	nodeID, err := GenerateNodeID()
 	if err != nil {
-		return nil, fmt.Errorf("read metadata: %w", err)
+		return nil, fmt.Errorf("generate node_id: %w", err)
 	}
-	var m Metadata
-	if err := json.Unmarshal(data, &m); err != nil {
-		return nil, fmt.Errorf("parse metadata: %w", err)
+
+	m := &Metadata{
+		Version: 2,
+		Role:    RoleTransit,
+		NodeID:  nodeID,
+		Domain:  v0.Domain,
+		SubPort: v0.SubPort,
+		Inbounds: []InboundMeta{
+			{
+				Tag:       "vless-in",
+				Protocol:  "vless",
+				Port:      v0.VlessPort,
+				Transport: "tcp",
+				PublicKey: v0.PublicKey,
+				ShortID:   v0.ShortID,
+				UUID:      v0.UUID,
+			},
+			{
+				Tag:       "hy2-in",
+				Protocol:  "hysteria2",
+				Port:      v0.Hy2Port,
+				Transport: "udp",
+			},
+		},
 	}
-	return &m, nil
+
+	// Note: hy2 password and obfs_password are in sing-box config, not in v0 metadata.
+	// They'll be populated from sing-box config if needed, or left empty for subscription
+	// generation which reads from the config file directly.
+
+	// Save migrated metadata
+	if err := m.Save(); err != nil {
+		return nil, fmt.Errorf("save migrated metadata: %w", err)
+	}
+
+	return m, nil
+}
+
+func GenerateNodeID() (string, error) {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
 
 func (m *Metadata) Save() error {
@@ -46,17 +181,103 @@ func (m *Metadata) Save() error {
 	return os.WriteFile(MetadataPath(), data, 0600)
 }
 
-func LoadSingBoxConfig() (*sbConfig, error) {
+// --- sing-box config read ---
+
+func LoadSingBoxConfig() (*SBConfig, error) {
 	data, err := os.ReadFile(ConfigPath())
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
-	var cfg sbConfig
+	var cfg SBConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 	return &cfg, nil
 }
+
+func SaveConfig(cfg *SBConfig) error {
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(ConfigPath(), data, 0600)
+}
+
+// SaveRawConfig saves an arbitrary config (used by entry/client which need richer JSON).
+func SaveRawConfig(cfg interface{}) error {
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(ConfigPath(), data, 0600)
+}
+
+// --- sing-box config structs ---
+
+type SBLog struct {
+	Level     string `json:"level"`
+	Timestamp bool   `json:"timestamp"`
+}
+
+type SBUser struct {
+	UUID     string `json:"uuid,omitempty"`
+	Flow     string `json:"flow,omitempty"`
+	Password string `json:"password,omitempty"`
+}
+
+type SBHandshake struct {
+	Server     string `json:"server"`
+	ServerPort int    `json:"server_port"`
+}
+
+type SBReality struct {
+	Enabled    bool        `json:"enabled"`
+	Handshake  SBHandshake `json:"handshake"`
+	PrivateKey string      `json:"private_key"`
+	ShortID    []string    `json:"short_id"`
+}
+
+type SBACME struct {
+	Domain []string `json:"domain"`
+	Email  string   `json:"email"`
+}
+
+type SBTLS struct {
+	Enabled    bool       `json:"enabled"`
+	ServerName string     `json:"server_name,omitempty"`
+	Reality    *SBReality `json:"reality,omitempty"`
+	ACME       *SBACME    `json:"acme,omitempty"`
+	ALPN       []string   `json:"alpn,omitempty"`
+}
+
+type SBObfs struct {
+	Type     string `json:"type"`
+	Password string `json:"password"`
+}
+
+type SBInbound struct {
+	Type                  string   `json:"type"`
+	Tag                   string   `json:"tag"`
+	Listen                string   `json:"listen"`
+	ListenPort            int      `json:"listen_port"`
+	Users                 []SBUser `json:"users,omitempty"`
+	TLS                   *SBTLS   `json:"tls,omitempty"`
+	IgnoreClientBandwidth *bool    `json:"ignore_client_bandwidth,omitempty"`
+	Obfs                  *SBObfs  `json:"obfs,omitempty"`
+}
+
+type SBOutbound struct {
+	Type string `json:"type"`
+	Tag  string `json:"tag"`
+}
+
+type SBConfig struct {
+	Log       SBLog        `json:"log"`
+	Inbounds  []SBInbound  `json:"inbounds"`
+	Outbounds []SBOutbound `json:"outbounds"`
+}
+
+// --- Install params (used by transit/exit install flows) ---
 
 type InstallParams struct {
 	Domain     string
@@ -71,118 +292,9 @@ type InstallParams struct {
 	ObfsPass   string
 }
 
-// sing-box config structs for type-safe JSON generation
+// --- Helpers ---
 
-type sbLog struct {
-	Level     string `json:"level"`
-	Timestamp bool   `json:"timestamp"`
-}
-
-type sbUser struct {
-	UUID     string `json:"uuid,omitempty"`
-	Flow     string `json:"flow,omitempty"`
-	Password string `json:"password,omitempty"`
-}
-
-type sbHandshake struct {
-	Server     string `json:"server"`
-	ServerPort int    `json:"server_port"`
-}
-
-type sbReality struct {
-	Enabled    bool        `json:"enabled"`
-	Handshake  sbHandshake `json:"handshake"`
-	PrivateKey string      `json:"private_key"`
-	ShortID    []string    `json:"short_id"`
-}
-
-type sbACME struct {
-	Domain []string `json:"domain"`
-	Email  string   `json:"email"`
-}
-
-type sbTLS struct {
-	Enabled    bool       `json:"enabled"`
-	ServerName string     `json:"server_name,omitempty"`
-	Reality    *sbReality `json:"reality,omitempty"`
-	ACME       *sbACME    `json:"acme,omitempty"`
-	ALPN       []string   `json:"alpn,omitempty"`
-}
-
-type sbObfs struct {
-	Type     string `json:"type"`
-	Password string `json:"password"`
-}
-
-type sbInbound struct {
-	Type                   string   `json:"type"`
-	Tag                    string   `json:"tag"`
-	Listen                 string   `json:"listen"`
-	ListenPort             int      `json:"listen_port"`
-	Users                  []sbUser `json:"users"`
-	TLS                    sbTLS    `json:"tls"`
-	IgnoreClientBandwidth  *bool    `json:"ignore_client_bandwidth,omitempty"`
-	Obfs                   *sbObfs  `json:"obfs,omitempty"`
-}
-
-type sbOutbound struct {
-	Type string `json:"type"`
-	Tag  string `json:"tag"`
-}
-
-type sbConfig struct {
-	Log       sbLog        `json:"log"`
-	Inbounds  []sbInbound  `json:"inbounds"`
-	Outbounds []sbOutbound `json:"outbounds"`
-}
-
-func GenerateConfig(p *InstallParams) *sbConfig {
-	rootDomain := extractRootDomain(p.Domain)
-	ignoreBW := true
-	return &sbConfig{
-		Log: sbLog{Level: "warn", Timestamp: true},
-		Inbounds: []sbInbound{
-			{
-				Type: "vless", Tag: "vless-in",
-				Listen: "::", ListenPort: p.VlessPort,
-				Users: []sbUser{{UUID: p.UUID, Flow: "xtls-rprx-vision"}},
-				TLS: sbTLS{
-					Enabled:    true,
-					ServerName: "www.walmart.com",
-					Reality: &sbReality{
-						Enabled:    true,
-						Handshake:  sbHandshake{Server: "www.walmart.com", ServerPort: 443},
-						PrivateKey: p.PrivateKey,
-						ShortID:    []string{p.ShortID},
-					},
-				},
-			},
-			{
-				Type: "hysteria2", Tag: "hy2-in",
-				Listen: "::", ListenPort: p.Hy2Port,
-				Users:                 []sbUser{{Password: p.Hy2Pass}},
-				IgnoreClientBandwidth: &ignoreBW,
-				Obfs:                  &sbObfs{Type: "salamander", Password: p.ObfsPass},
-				TLS: sbTLS{
-					Enabled: true,
-					ACME:    &sbACME{Domain: []string{p.Domain}, Email: "admin@" + rootDomain},
-					ALPN:    []string{"h3"},
-				},
-			},
-		},
-		Outbounds: []sbOutbound{{Type: "direct", Tag: "direct"}},
-	}
-}
-
-func SaveConfig(cfg *sbConfig) error {
-	data, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(ConfigPath(), data, 0600)
-}
-
-func extractRootDomain(domain string) string {
+func ExtractRootDomain(domain string) string {
 	parts := strings.Split(domain, ".")
 	if len(parts) >= 2 {
 		return parts[len(parts)-2] + "." + parts[len(parts)-1]

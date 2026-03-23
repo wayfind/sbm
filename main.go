@@ -42,6 +42,12 @@ func main() {
 		err = cmd.RunCert()
 	case "renew":
 		err = cmd.RunRenew()
+	case "topology":
+		err = cmd.RunTopology(os.Args[2:])
+	case "bwg":
+		err = cmd.RunBWG(os.Args[2:])
+	case "client":
+		err = cmd.RunClient(os.Args[2:])
 	case "metadata":
 		err = cmd.RunMetadata()
 	case "version", "-v", "--version":
@@ -71,6 +77,7 @@ func interactiveMenu() {
 		"查看配置",
 		"查看订阅",
 		"查看证书",
+		"查看拓扑",
 		"证书续期",
 		"版本信息",
 	}
@@ -113,8 +120,10 @@ func interactiveMenu() {
 		case 9:
 			err = cmd.RunCert()
 		case 10:
-			err = cmd.RunRenew()
+			err = cmd.RunTopology(nil)
 		case 11:
+			err = cmd.RunRenew()
+		case 12:
 			err = cmd.RunVersion()
 		}
 
@@ -128,17 +137,21 @@ func usage() {
 	fmt.Println(`sing-box-manager (sbm) - sing-box 部署管理工具
 
 用法:
-  sbm                          交互式菜单
-  sbm install --domain <域名>  安装 (AI 模式: --force 跳过确认)
-  sbm start                    启动服务
-  sbm stop                     停止服务
-  sbm restart                  重启服务
-  sbm status                   查看状态
-  sbm logs [-n 100]            查看日志
-  sbm config                   查看配置 (脱敏)
-  sbm sub                      查看订阅
-  sbm cert                     查看证书
-  sbm renew                    证书续期
-  sbm serve                    启动订阅 HTTPS 服务 (前台)
-  sbm version                  版本信息`)
+  sbm                                          交互式菜单
+  sbm install --role <角色> --domain <域名>    安装 (角色: transit/exit/entry)
+  sbm start                                    启动服务
+  sbm stop                                     停止服务
+  sbm restart                                  重启服务
+  sbm status                                   查看状态
+  sbm logs [-n 100]                            查看日志
+  sbm config                                   查看配置 (脱敏)
+  sbm sub                                      查看订阅
+  sbm cert                                     查看证书
+  sbm renew                                    证书续期
+  sbm topology                                 查看拓扑
+  sbm bwg status                               查看 GIA 带宽
+  sbm bwg rotate                               手动流量均衡
+  sbm client gen --upstream <URL> --platform <平台>  生成客户端配置
+  sbm serve                                    启动订阅 HTTPS 服务 (前台)
+  sbm version                                  版本信息`)
 }

@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"sing-box-manager/internal"
+	"time"
 )
 
 func RunServe(args []string) error {
@@ -21,7 +22,7 @@ func RunServe(args []string) error {
 
 	listenPort := meta.SubPort
 	if listenPort == 0 {
-		listenPort = 20032
+		listenPort = 20033
 	}
 	if *port != 0 {
 		listenPort = *port
@@ -30,8 +31,28 @@ func RunServe(args []string) error {
 	certFile := internal.CertPath(meta.Domain)
 	keyFile := internal.CertKeyPath(meta.Domain)
 
+	// Topology store for aggregating downstream reports
+	topoStore := internal.NewTopoStore()
+
 	mux := http.NewServeMux()
+
+	// Subscription endpoint (existing)
 	mux.HandleFunc("/sub/hz-office", handleSub)
+
+	// Topology API endpoints
+	mux.HandleFunc("/node-info", internal.BearerAuth(meta.APIToken, internal.HandleNodeInfo(meta)))
+	mux.HandleFunc("/topology", internal.BearerAuth(meta.APIToken, internal.HandleTopology(meta, topoStore)))
+	mux.HandleFunc("/report", internal.BearerAuth(meta.APIToken, internal.HandleReport(topoStore)))
+
+	// Start topology reporter (reports to upstreams)
+	internal.StartTopologyReporter(meta, topoStore, 5*time.Minute)
+
+	// Start failover loop for entry nodes
+	if meta.Role == internal.RoleEntry {
+		if failoverCfg, err := loadFailoverConfig(); err == nil && len(failoverCfg.Transits) > 0 {
+			internal.StartFailoverLoop(failoverCfg, 1*time.Hour)
+		}
+	}
 
 	srv := &http.Server{
 		Addr:    fmt.Sprintf(":%d", listenPort),
@@ -48,7 +69,7 @@ func RunServe(args []string) error {
 		},
 	}
 
-	log.Printf("subscription server listening on :%d", listenPort)
+	log.Printf("subscription server listening on :%d (role=%s)", listenPort, meta.Role)
 	return srv.ListenAndServeTLS("", "")
 }
 
