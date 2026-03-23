@@ -16,10 +16,14 @@ func RunTopology(args []string) error {
 		return err
 	}
 
-	// Try to fetch from local serve's /topology endpoint first
 	tree, err := fetchLocalTopology(meta)
 	if err != nil {
-		// Fallback: show local-only view
+		if internal.JSONMode {
+			// Fallback: output static local-only tree as JSON
+			localTree := internal.BuildTopologyTree(meta, nil)
+			internal.PrintJSON(localTree)
+			return nil
+		}
 		fmt.Println("(无法连接本地服务，显示静态视图)")
 		fmt.Println()
 		localTree := internal.BuildTopologyTree(meta, nil)
@@ -27,6 +31,10 @@ func RunTopology(args []string) error {
 		return nil
 	}
 
+	if internal.JSONMode {
+		internal.PrintJSON(tree)
+		return nil
+	}
 	internal.PrintTopologyTree(tree, "")
 	return nil
 }

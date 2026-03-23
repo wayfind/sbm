@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -186,6 +187,13 @@ func HandleReport(store *TopoStore) http.HandlerFunc {
 		if tree.Self.NodeID == "" {
 			http.Error(w, "missing node_id", http.StatusBadRequest)
 			return
+		}
+		// Auto-fill address from RemoteAddr if node didn't provide one
+		if tree.Self.Address == "" && tree.Self.Domain == "" {
+			host, _, _ := net.SplitHostPort(r.RemoteAddr)
+			if host != "" {
+				tree.Self.Address = host
+			}
 		}
 		store.Update(tree)
 		w.WriteHeader(http.StatusOK)

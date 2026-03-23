@@ -47,8 +47,10 @@ type InboundMeta struct {
 	PublicKey string `json:"public_key,omitempty"`   // vless reality
 	ShortID   string `json:"short_id,omitempty"`     // vless reality
 	UUID      string `json:"uuid,omitempty"`         // vless
-	Password  string `json:"password,omitempty"`     // hy2, ss
+	Username  string `json:"username,omitempty"`      // socks auth
+	Password  string `json:"password,omitempty"`     // hy2, ss, socks auth
 	ObfsPass  string `json:"obfs_password,omitempty"` // hy2 salamander
+	ForExit   string `json:"for_exit,omitempty"`      // non-empty = per-exit channel inbound
 }
 
 type UpstreamMeta struct {
@@ -77,6 +79,11 @@ type Metadata struct {
 	APIToken string `json:"api_token,omitempty"`
 
 	BWG *BWGConfig `json:"bwg,omitempty"`
+
+	// Per-exit channel state (persisted for stability across restarts)
+	ExitPorts      map[string]int    `json:"exit_ports,omitempty"`       // transit: exit_name → per-exit inbound port
+	ExitAuth       map[string]string `json:"exit_auth,omitempty"`        // transit: exit_name → per-exit socks auth password
+	ExitSocksPorts map[string]int    `json:"exit_socks_ports,omitempty"` // entry: exit_name → localhost socks5 port
 }
 
 // LoadMetadata loads metadata.json with automatic v0→v2 migration.

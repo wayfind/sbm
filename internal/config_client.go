@@ -66,8 +66,6 @@ func GenerateClientConfig(p *ClientParams) map[string]interface{} {
 
 	outbounds = append(outbounds,
 		map[string]interface{}{"type": "direct", "tag": "direct"},
-		map[string]interface{}{"type": "dns", "tag": "dns-out"},
-		map[string]interface{}{"type": "block", "tag": "block"},
 	)
 
 	// --- DNS ---

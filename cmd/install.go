@@ -19,6 +19,8 @@ type InstallFlags struct {
 	SubPort       int
 	Force         bool
 	UpstreamsFile string
+	CertFile      string
+	KeyFile       string
 }
 
 // cryptoMaterials holds generated keys/passwords for a new installation.
@@ -41,17 +43,26 @@ func RunInstall(args []string) error {
 	fs.IntVar(&f.SubPort, "sub-port", 20033, "订阅服务端口")
 	fs.BoolVar(&f.Force, "force", false, "跳过替换确认")
 	fs.StringVar(&f.UpstreamsFile, "upstreams", "", "上游节点配置文件 (entry 必选)")
+	fs.StringVar(&f.CertFile, "cert", "", "TLS 证书文件路径 (替代 ACME)")
+	fs.StringVar(&f.KeyFile, "key", "", "TLS 私钥文件路径 (替代 ACME)")
 	fs.Parse(args)
 
 	role := internal.NodeRole(f.Role)
 	if !role.Valid() {
 		return fmt.Errorf("无效角色: %s (可选: transit, exit, entry, client)", f.Role)
 	}
-	if f.Domain == "" {
+	if f.Domain == "" && role != internal.RoleExit {
+		if internal.JSONMode {
+			return fmt.Errorf("域名不能为空 (--domain required)")
+		}
 		f.Domain = promptString("请输入域名")
 		if f.Domain == "" {
 			return fmt.Errorf("域名不能为空")
 		}
+	}
+	// --json implies --force (AI mode = non-interactive)
+	if internal.JSONMode {
+		f.Force = true
 	}
 
 	switch role {
@@ -84,7 +95,7 @@ func prepareInstall(f *InstallFlags) (bool, error) {
 			}
 		}
 		if oldMeta, err := internal.LoadMetadata(); err == nil {
-			fmt.Println("清理旧防火墙规则...")
+			humanPrint("清理旧防火墙规则...\n")
 			for _, inb := range oldMeta.Inbounds {
 				internal.FirewallRemovePort(inb.Port, inb.Transport)
 			}
@@ -96,7 +107,7 @@ func prepareInstall(f *InstallFlags) (bool, error) {
 			internal.FirewallReload()
 		}
 		backup := fmt.Sprintf("/etc/sing-box.backup-%s", time.Now().Format("20060102-150405"))
-		fmt.Printf("备份到: %s\n", backup)
+		humanPrint("备份到: %s\n", backup)
 		internal.SystemctlOp("stop", "sing-box", "sub-server")
 		internal.SystemctlOp("disable", "sing-box", "sub-server")
 		os.Rename(internal.DeployDir, backup)
@@ -142,8 +153,10 @@ func assignPorts(f *InstallFlags) {
 	}
 }
 
-// finishInstall installs systemd units, cron, firewall rules, starts services, waits for ACME.
-func finishInstall(f *InstallFlags, extraTCPPorts ...int) error {
+// finishInstall installs systemd units, cron, firewall rules, starts services.
+// For transit/entry: opens Hy2 port, ACME port 80, waits for cert.
+// For exit: only opens VLESS port (no ACME needed).
+func finishInstall(f *InstallFlags, role internal.NodeRole, extraTCPPorts ...int) error {
 	sbmPath, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("resolve executable path: %w", err)
@@ -161,18 +174,27 @@ func finishInstall(f *InstallFlags, extraTCPPorts ...int) error {
 	}
 
 	internal.FirewallAddPort(f.VlessPort, "tcp")
-	internal.FirewallAddPort(f.Hy2Port, "udp")
+	if role != internal.RoleExit {
+		internal.FirewallAddPort(f.Hy2Port, "udp")
+	}
 	internal.FirewallAddPort(f.SubPort, "tcp")
 	for _, p := range extraTCPPorts {
 		internal.FirewallAddPort(p, "tcp")
 	}
-	internal.FirewallTempAddPort(80, "tcp")
+
+	if role != internal.RoleExit {
+		// ACME needs port 80 temporarily
+		internal.FirewallTempAddPort(80, "tcp")
+	}
 	internal.FirewallReload()
 
 	internal.SystemctlOp("enable", "--now", "sing-box", "sub-server")
-	fmt.Println("等待 ACME 证书签发...")
-	time.Sleep(10 * time.Second)
-	internal.FirewallTempRemovePort(80, "tcp")
+
+	if role != internal.RoleExit {
+		humanPrint("等待 ACME 证书签发...\n")
+		time.Sleep(10 * time.Second)
+		internal.FirewallTempRemovePort(80, "tcp")
+	}
 	return nil
 }
 
@@ -204,7 +226,7 @@ func installServerNode(role internal.NodeRole, f *InstallFlags) error {
 		internal.RoleTransit: "传输节点",
 		internal.RoleExit:    "出口节点",
 	}[role]
-	fmt.Printf("=== sing-box %s部署 ===\n", roleLabel)
+	humanPrint("=== sing-box %s部署 ===\n", roleLabel)
 
 	ok, err := prepareInstall(f)
 	if err != nil {
@@ -214,21 +236,22 @@ func installServerNode(role internal.NodeRole, f *InstallFlags) error {
 		return nil
 	}
 
-	fmt.Printf("域名: %s\n", f.Domain)
-	fmt.Println("生成密钥...")
+	if f.Domain != "" {
+		humanPrint("域名: %s\n", f.Domain)
+	}
+	humanPrint("生成密钥...\n")
 	cm, err := generateCryptoMaterials()
 	if err != nil {
 		return err
 	}
 	assignPorts(f)
-	fmt.Printf("VLESS Reality 端口: %d\n", f.VlessPort)
-	fmt.Printf("Hysteria2 端口: %d\n", f.Hy2Port)
+	humanPrint("VLESS Reality 端口: %d\n", f.VlessPort)
 
-	// Config
 	params := buildInstallParams(f, cm)
 	var cfg *internal.SBConfig
 	switch role {
 	case internal.RoleTransit:
+		humanPrint("Hysteria2 端口: %d\n", f.Hy2Port)
 		cfg = internal.GenerateTransitConfig(params)
 	case internal.RoleExit:
 		cfg = internal.GenerateExitConfig(params)
@@ -237,38 +260,64 @@ func installServerNode(role internal.NodeRole, f *InstallFlags) error {
 		return fmt.Errorf("save config: %w", err)
 	}
 
-	// Metadata
 	nodeID, err := internal.GenerateNodeID()
 	if err != nil {
 		return err
 	}
+
+	// Exit only has VLESS inbound (no Hy2, no ACME)
+	var inboundMetas []internal.InboundMeta
+	if role == internal.RoleExit {
+		inboundMetas = []internal.InboundMeta{{
+			Tag: "vless-in", Protocol: "vless", Port: f.VlessPort, Transport: "tcp",
+			PublicKey: cm.PublicKey, ShortID: cm.ShortID, UUID: cm.UUID,
+		}}
+	} else {
+		inboundMetas = buildBaseInboundMetas(f, cm)
+	}
+
 	meta := &internal.Metadata{
 		Version: 2, Role: role, NodeID: nodeID,
 		Domain: f.Domain, SubPort: f.SubPort,
-		Inbounds: buildBaseInboundMetas(f, cm),
+		Inbounds: inboundMetas,
 	}
 	if err := meta.Save(); err != nil {
 		return fmt.Errorf("save metadata: %w", err)
 	}
 
-	if err := finishInstall(f); err != nil {
+	if err := finishInstall(f, role); err != nil {
 		return err
 	}
 
-	fmt.Printf("\n=== %s部署完成 ===\n", roleLabel)
-	fmt.Printf("角色:       %s\n", role)
-	fmt.Printf("sing-box:   %s\n", activeStr("sing-box"))
-	fmt.Printf("sub-server: %s\n", activeStr("sub-server"))
-	fmt.Printf("VLESS:      %d/tcp\n", f.VlessPort)
-	fmt.Printf("Hysteria2:  %d/udp\n", f.Hy2Port)
-	fmt.Printf("订阅地址:   https://%s:%d/sub/hz-office\n", f.Domain, f.SubPort)
+	resultData := map[string]interface{}{
+		"status": "ok", "role": string(role),
+		"vless_port": f.VlessPort,
+	}
+	if f.Domain != "" {
+		resultData["domain"] = f.Domain
+		resultData["sub_url"] = fmt.Sprintf("https://%s:%d/sub/hz-office", f.Domain, f.SubPort)
+	}
+	if role == internal.RoleTransit {
+		resultData["hy2_port"] = f.Hy2Port
+	}
 
-	result, _ := json.MarshalIndent(map[string]interface{}{
-		"status": "ok", "role": string(role), "domain": f.Domain,
-		"vless_port": f.VlessPort, "hy2_port": f.Hy2Port,
-		"sub_url": fmt.Sprintf("https://%s:%d/sub/hz-office", f.Domain, f.SubPort),
-	}, "", "  ")
-	fmt.Println(string(result))
+	if internal.JSONMode {
+		internal.PrintJSON(resultData)
+	} else {
+		fmt.Printf("\n=== %s部署完成 ===\n", roleLabel)
+		fmt.Printf("角色:       %s\n", role)
+		fmt.Printf("sing-box:   %s\n", activeStr("sing-box"))
+		fmt.Printf("sub-server: %s\n", activeStr("sub-server"))
+		fmt.Printf("VLESS:      %d/tcp\n", f.VlessPort)
+		if role == internal.RoleTransit {
+			fmt.Printf("Hysteria2:  %d/udp\n", f.Hy2Port)
+		}
+		if f.Domain != "" {
+			fmt.Printf("订阅地址:   https://%s:%d/sub/hz-office\n", f.Domain, f.SubPort)
+		}
+		result, _ := json.MarshalIndent(resultData, "", "  ")
+		fmt.Println(string(result))
+	}
 	return nil
 }
 
@@ -288,7 +337,7 @@ type Socks5Config struct {
 }
 
 func installEntryNode(f *InstallFlags) error {
-	fmt.Println("=== sing-box 接入节点部署 ===")
+	humanPrint("=== sing-box 接入节点部署 ===\n")
 
 	if f.UpstreamsFile == "" {
 		return fmt.Errorf("entry 安装需要 --upstreams 参数，指定上游节点配置文件")
@@ -314,23 +363,24 @@ func installEntryNode(f *InstallFlags) error {
 		return nil
 	}
 
-	fmt.Printf("域名: %s\n", f.Domain)
-	fmt.Println("生成密钥...")
+	humanPrint("域名: %s\n", f.Domain)
+	humanPrint("生成密钥...\n")
 	cm, err := generateCryptoMaterials()
 	if err != nil {
 		return err
 	}
 	assignPorts(f)
-	fmt.Printf("VLESS Reality 端口: %d\n", f.VlessPort)
-	fmt.Printf("Hysteria2 端口: %d\n", f.Hy2Port)
-	fmt.Printf("Transit 上游: %d 个\n", len(upCfg.Transits))
-	fmt.Printf("Exit 上游: %d 个\n", len(upCfg.Exits))
+	humanPrint("VLESS Reality 端口: %d\n", f.VlessPort)
+	humanPrint("Hysteria2 端口: %d\n", f.Hy2Port)
+	humanPrint("Transit 上游: %d 个\n", len(upCfg.Transits))
+	humanPrint("Exit 上游: %d 个\n", len(upCfg.Exits))
 
 	// Entry config
 	entryParams := &internal.EntryParams{
 		Domain: f.Domain, VlessPort: f.VlessPort, Hy2Port: f.Hy2Port,
 		SubPort: f.SubPort, UUID: cm.UUID, PrivateKey: cm.PrivateKey, PublicKey: cm.PublicKey,
 		ShortID: cm.ShortID, Hy2Pass: cm.Hy2Pass, ObfsPass: cm.ObfsPass,
+		CertFile: f.CertFile, KeyFile: f.KeyFile,
 		Transits: upCfg.Transits, Exits: upCfg.Exits,
 	}
 	if upCfg.Socks5 != nil {
@@ -378,28 +428,33 @@ func installEntryNode(f *InstallFlags) error {
 	if upCfg.Socks5 != nil && upCfg.Socks5.Port > 0 {
 		extraPorts = append(extraPorts, upCfg.Socks5.Port)
 	}
-	if err := finishInstall(f, extraPorts...); err != nil {
+	if err := finishInstall(f, internal.RoleEntry, extraPorts...); err != nil {
 		return err
 	}
 
-	fmt.Printf("\n=== 接入节点部署完成 ===\n")
-	fmt.Printf("角色:       entry\n")
-	fmt.Printf("sing-box:   %s\n", activeStr("sing-box"))
-	fmt.Printf("sub-server: %s\n", activeStr("sub-server"))
-	fmt.Printf("VLESS:      %d/tcp\n", f.VlessPort)
-	fmt.Printf("Hysteria2:  %d/udp\n", f.Hy2Port)
-	if upCfg.Socks5 != nil && upCfg.Socks5.Port > 0 {
-		fmt.Printf("SOCKS5:     %d/tcp\n", upCfg.Socks5.Port)
-	}
-	fmt.Printf("订阅地址:   https://%s:%d/sub/hz-office\n", f.Domain, f.SubPort)
-
-	result, _ := json.MarshalIndent(map[string]interface{}{
+	resultData := map[string]interface{}{
 		"status": "ok", "role": "entry", "domain": f.Domain,
 		"vless_port": f.VlessPort, "hy2_port": f.Hy2Port,
 		"transits": len(upCfg.Transits), "exits": len(upCfg.Exits),
 		"sub_url": fmt.Sprintf("https://%s:%d/sub/hz-office", f.Domain, f.SubPort),
-	}, "", "  ")
-	fmt.Println(string(result))
+	}
+
+	if internal.JSONMode {
+		internal.PrintJSON(resultData)
+	} else {
+		fmt.Printf("\n=== 接入节点部署完成 ===\n")
+		fmt.Printf("角色:       entry\n")
+		fmt.Printf("sing-box:   %s\n", activeStr("sing-box"))
+		fmt.Printf("sub-server: %s\n", activeStr("sub-server"))
+		fmt.Printf("VLESS:      %d/tcp\n", f.VlessPort)
+		fmt.Printf("Hysteria2:  %d/udp\n", f.Hy2Port)
+		if upCfg.Socks5 != nil && upCfg.Socks5.Port > 0 {
+			fmt.Printf("SOCKS5:     %d/tcp\n", upCfg.Socks5.Port)
+		}
+		fmt.Printf("订阅地址:   https://%s:%d/sub/hz-office\n", f.Domain, f.SubPort)
+		result, _ := json.MarshalIndent(resultData, "", "  ")
+		fmt.Println(string(result))
+	}
 	return nil
 }
 
@@ -420,6 +475,13 @@ func activeStr(unit string) string {
 		return "active"
 	}
 	return "inactive"
+}
+
+// humanPrint prints only in human mode (non-JSON).
+func humanPrint(format string, args ...interface{}) {
+	if !internal.JSONMode {
+		fmt.Printf(format, args...)
+	}
 }
 
 func installRenewCron(sbmPath string) error {

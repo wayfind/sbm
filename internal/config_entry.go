@@ -12,6 +12,10 @@ type EntryParams struct {
 	Hy2Port   int
 	SubPort   int
 
+	// TLS certificate files (alternative to ACME, e.g. certbot-managed)
+	CertFile string // path to fullchain.pem
+	KeyFile  string // path to privkey.pem
+
 	// Crypto materials for client-facing inbounds
 	UUID       string
 	PrivateKey string
@@ -66,12 +70,10 @@ func GenerateEntryConfig(p *EntryParams) (map[string]interface{}, error) {
 		return nil, fmt.Errorf("entry node requires at least one transit upstream")
 	}
 
-	rootDomain := ExtractRootDomain(p.Domain)
-
 	// --- Inbounds ---
 	inbounds := []interface{}{}
 
-	// VLESS Reality inbound (client-facing)
+	// VLESS Reality inbound (always, no domain needed)
 	inbounds = append(inbounds, map[string]interface{}{
 		"type": "vless", "tag": "vless-in",
 		"listen": "::", "listen_port": p.VlessPort,
@@ -90,20 +92,34 @@ func GenerateEntryConfig(p *EntryParams) (map[string]interface{}, error) {
 		},
 	})
 
-	// Hysteria2 inbound (client-facing)
-	ignoreBW := true
-	inbounds = append(inbounds, map[string]interface{}{
-		"type": "hysteria2", "tag": "hy2-in",
-		"listen": "::", "listen_port": p.Hy2Port,
-		"users":                    []map[string]interface{}{{"password": p.Hy2Pass}},
-		"ignore_client_bandwidth":  ignoreBW,
-		"obfs":                     map[string]interface{}{"type": "salamander", "password": p.ObfsPass},
-		"tls": map[string]interface{}{
+	// Hysteria2 inbound (needs TLS: cert file or ACME)
+	if p.CertFile != "" || p.Domain != "" {
+		ignoreBW := true
+		hy2TLS := map[string]interface{}{
 			"enabled": true,
-			"acme":    map[string]interface{}{"domain": []string{p.Domain}, "email": "admin@" + rootDomain},
 			"alpn":    []string{"h3"},
-		},
-	})
+		}
+		if p.CertFile != "" {
+			// Use external certificate (e.g. certbot)
+			hy2TLS["certificate_path"] = p.CertFile
+			hy2TLS["key_path"] = p.KeyFile
+			if p.Domain != "" {
+				hy2TLS["server_name"] = p.Domain
+			}
+		} else {
+			// Use ACME (sing-box auto-manages cert)
+			rootDomain := ExtractRootDomain(p.Domain)
+			hy2TLS["acme"] = map[string]interface{}{"domain": []string{p.Domain}, "email": "admin@" + rootDomain}
+		}
+		inbounds = append(inbounds, map[string]interface{}{
+			"type": "hysteria2", "tag": "hy2-in",
+			"listen": "::", "listen_port": p.Hy2Port,
+			"users":                   []map[string]interface{}{{"password": p.Hy2Pass}},
+			"ignore_client_bandwidth": ignoreBW,
+			"obfs":                    map[string]interface{}{"type": "salamander", "password": p.ObfsPass},
+			"tls":                     hy2TLS,
+		})
+	}
 
 	// SOCKS5 inbound for H800 relay (optional)
 	if p.Socks5Port > 0 {
@@ -119,108 +135,20 @@ func GenerateEntryConfig(p *EntryParams) (map[string]interface{}, error) {
 		inbounds = append(inbounds, socks)
 	}
 
-	// --- Outbounds ---
-	outbounds := []interface{}{}
-	transitTags := []string{}
+	outbounds := BuildEntryOutbounds(p.Transits, p.Exits)
+	route := BuildEntryRoute(p.Exits, p.Socks5Port, p.Socks5DirectIPs)
 
-	// Transit (GIA) outbounds
-	for _, t := range p.Transits {
-		tag := "transit-" + t.Name
-		transitTags = append(transitTags, tag)
-		outbounds = append(outbounds, BuildProxyOutbound(tag, &t))
-	}
-
-	// URLTest group for transit auto-selection
-	outbounds = append(outbounds, map[string]interface{}{
-		"type":      "urltest",
-		"tag":       "gia-auto",
-		"outbounds": transitTags,
-		"url":       "https://www.gstatic.com/generate_204",
-		"interval":  "5m",
-		"tolerance": 100,
-	})
-
-	// Exit (residential) outbounds — chained through transit
-	for _, e := range p.Exits {
-		tag := "exit-" + e.Name
-		outbounds = append(outbounds, buildExitOutbound(tag, &e))
-	}
-
-	// Residential chain selector (if we have exits)
-	if len(p.Exits) > 0 {
-		exitTags := make([]string, len(p.Exits))
-		for i, e := range p.Exits {
-			exitTags[i] = "exit-" + e.Name
-		}
-		outbounds = append(outbounds, map[string]interface{}{
-			"type":      "urltest",
-			"tag":       "residential",
-			"outbounds": exitTags,
-			"url":       "https://www.gstatic.com/generate_204",
-			"interval":  "5m",
-			"tolerance": 200,
-		})
-	}
-
-	// Direct + DNS outbounds
-	outbounds = append(outbounds,
-		map[string]interface{}{"type": "direct", "tag": "direct"},
-		map[string]interface{}{"type": "dns", "tag": "dns-out"},
-		map[string]interface{}{"type": "block", "tag": "block"},
-	)
-
-	// --- DNS ---
 	dns := map[string]interface{}{
 		"servers": []map[string]interface{}{
 			{"tag": "remote", "type": "tls", "server": "8.8.8.8", "detour": "gia-auto"},
-			{"tag": "local", "type": "https", "server": "223.5.5.5"},
+			{"tag": "local", "type": "udp", "server": "223.5.5.5"},
+			{"tag": "system", "type": "local"}, // system resolver for outbound domain resolution
 		},
 		"rules": []map[string]interface{}{
 			{"rule_set": "geosite-cn", "server": "local"},
 		},
 	}
 
-	// --- Route rules ---
-	rules := []interface{}{
-		map[string]interface{}{"protocol": "dns", "action": "route", "outbound": "dns-out"},
-		map[string]interface{}{"ip_is_private": true, "action": "route", "outbound": "direct"},
-		// CN traffic → direct
-		map[string]interface{}{"rule_set": []string{"geoip-cn", "geosite-cn"}, "action": "route", "outbound": "direct"},
-	}
-
-	// AI services → residential (if exits configured)
-	if len(p.Exits) > 0 {
-		rules = append(rules, map[string]interface{}{
-			"domain": AIResidentialDomains,
-			"action": "route",
-			"outbound": "residential",
-		})
-	}
-
-	// SOCKS5 H800 direct routing rules
-	if p.Socks5Port > 0 && len(p.Socks5DirectIPs) > 0 {
-		rules = append(rules, map[string]interface{}{
-			"inbound":    []string{"socks-in"},
-			"ip_cidr":    p.Socks5DirectIPs,
-			"action":     "route",
-			"outbound":   "direct",
-		})
-	}
-
-	// Default overseas → gia-auto
-	route := map[string]interface{}{
-		"rules": rules,
-		"rule_set": []map[string]interface{}{
-			{"tag": "geosite-cn", "type": "remote", "format": "binary",
-				"url": RuleSetGeositeCN, "download_detour": "gia-auto"},
-			{"tag": "geoip-cn", "type": "remote", "format": "binary",
-				"url": RuleSetGeoipCN, "download_detour": "gia-auto"},
-		},
-		"final":                "gia-auto",
-		"auto_detect_interface": true,
-	}
-
-	// --- Experimental ---
 	experimental := map[string]interface{}{
 		"cache_file": map[string]interface{}{
 			"enabled":    true,
@@ -313,4 +241,88 @@ func buildExitOutbound(tag string, e *ExitInfo) map[string]interface{} {
 		out["detour"] = "transit-" + e.ViaTransit
 	}
 	return out
+}
+
+// BuildEntryOutbounds builds the outbounds section for an entry node config.
+// Used by both GenerateEntryConfig (initial install) and reconcile (auto-update).
+func BuildEntryOutbounds(transits []TransitInfo, exits []ExitInfo) []interface{} {
+	outbounds := []interface{}{}
+	transitTags := []string{}
+
+	for _, t := range transits {
+		tag := "transit-" + t.Name
+		transitTags = append(transitTags, tag)
+		outbounds = append(outbounds, BuildProxyOutbound(tag, &t))
+	}
+
+	outbounds = append(outbounds, map[string]interface{}{
+		"type":      "urltest",
+		"tag":       "gia-auto",
+		"outbounds": transitTags,
+		"url":       "https://www.gstatic.com/generate_204",
+		"interval":  "5m",
+		"tolerance": 100,
+	})
+
+	for _, e := range exits {
+		tag := "exit-" + e.Name
+		exitCopy := e
+		outbounds = append(outbounds, buildExitOutbound(tag, &exitCopy))
+	}
+
+	if len(exits) > 0 {
+		exitTags := make([]string, len(exits))
+		for i, e := range exits {
+			exitTags[i] = "exit-" + e.Name
+		}
+		outbounds = append(outbounds, map[string]interface{}{
+			"type":      "urltest",
+			"tag":       "residential",
+			"outbounds": exitTags,
+			"url":       "https://www.gstatic.com/generate_204",
+			"interval":  "5m",
+			"tolerance": 200,
+		})
+	}
+
+	outbounds = append(outbounds,
+		map[string]interface{}{"type": "direct", "tag": "direct"},
+	)
+
+	return outbounds
+}
+
+// BuildEntryRoute builds the route section for an entry node config.
+// extraSocksRules is optional (for SOCKS5 H800 direct routing).
+func BuildEntryRoute(exits []ExitInfo, socks5Port int, socks5DirectIPs []string) map[string]interface{} {
+	rules := []interface{}{
+		map[string]interface{}{"protocol": "dns", "action": "hijack-dns"},
+		map[string]interface{}{"ip_is_private": true, "action": "route", "outbound": "direct"},
+		map[string]interface{}{"rule_set": []string{"geoip-cn", "geosite-cn"}, "action": "route", "outbound": "direct"},
+	}
+
+	if len(exits) > 0 {
+		rules = append(rules, map[string]interface{}{
+			"domain":   AIResidentialDomains,
+			"action":   "route",
+			"outbound": "residential",
+		})
+	}
+
+	if socks5Port > 0 && len(socks5DirectIPs) > 0 {
+		rules = append(rules, map[string]interface{}{
+			"inbound":  []string{"socks-in"},
+			"ip_cidr":  socks5DirectIPs,
+			"action":   "route",
+			"outbound": "direct",
+		})
+	}
+
+	return map[string]interface{}{
+		"rules":                  rules,
+		"rule_set":               BuildRuleSetDefs(),
+		"final":                  "gia-auto",
+		"auto_detect_interface":  true,
+		"default_domain_resolver": "system", // resolve outbound server domains via system DNS, not via proxy
+	}
 }

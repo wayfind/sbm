@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"sort"
 	"time"
 )
@@ -110,7 +109,6 @@ func RebalanceEntryConfig(failoverCfg *FailoverConfig) error {
 		return fmt.Errorf("all transits exhausted")
 	}
 
-	// Log status
 	for _, s := range statuses {
 		status := "OK"
 		if !s.Available {
@@ -121,7 +119,9 @@ func RebalanceEntryConfig(failoverCfg *FailoverConfig) error {
 	}
 	log.Printf("[failover] balanced order: %v", ordered)
 
-	// Read current config
+	ConfigMu.Lock()
+	defer ConfigMu.Unlock()
+
 	data, err := os.ReadFile(ConfigPath())
 	if err != nil {
 		return fmt.Errorf("read config: %w", err)
@@ -132,7 +132,6 @@ func RebalanceEntryConfig(failoverCfg *FailoverConfig) error {
 		return fmt.Errorf("parse config: %w", err)
 	}
 
-	// Find and update gia-auto urltest outbound
 	outbounds, ok := config["outbounds"].([]interface{})
 	if !ok {
 		return fmt.Errorf("config outbounds not found")
@@ -145,7 +144,6 @@ func RebalanceEntryConfig(failoverCfg *FailoverConfig) error {
 			continue
 		}
 		if obMap["tag"] == "gia-auto" && obMap["type"] == "urltest" {
-			// Rebuild outbounds list with transit- prefix
 			tags := make([]interface{}, len(ordered))
 			for j, name := range ordered {
 				tags[j] = "transit-" + name
@@ -163,35 +161,12 @@ func RebalanceEntryConfig(failoverCfg *FailoverConfig) error {
 
 	config["outbounds"] = outbounds
 
-	// Validate with sing-box check
 	newData, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
 
-	// Write to temp file for validation
-	tmpFile := ConfigPath() + ".tmp"
-	if err := os.WriteFile(tmpFile, newData, 0600); err != nil {
-		return fmt.Errorf("write temp config: %w", err)
-	}
-	defer os.Remove(tmpFile)
-
-	if err := exec.Command("sing-box", "check", "-c", tmpFile).Run(); err != nil {
-		return fmt.Errorf("config validation failed: %w", err)
-	}
-
-	// Atomic replace
-	if err := os.WriteFile(ConfigPath(), newData, 0600); err != nil {
-		return fmt.Errorf("write config: %w", err)
-	}
-
-	// Reload sing-box via systemctl (sends SIGHUP, keeps connections alive)
-	log.Println("[failover] config updated, reloading sing-box")
-	if err := SystemctlOp("reload", "sing-box"); err != nil {
-		log.Printf("[failover] reload failed, falling back to restart: %v", err)
-		return SystemctlOp("restart", "sing-box")
-	}
-	return nil
+	return validateAndApplyConfig(newData, "[failover]")
 }
 
 // StartFailoverLoop runs periodic bandwidth balancing on the entry node.

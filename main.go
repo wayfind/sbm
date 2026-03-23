@@ -4,11 +4,15 @@ import (
 	"fmt"
 	"os"
 	"sing-box-manager/cmd"
+	"sing-box-manager/internal"
 
 	"golang.org/x/term"
 )
 
 func main() {
+	// Scan and consume --json flag before command dispatch
+	internal.JSONMode, os.Args = extractFlag(os.Args, "--json")
+
 	if len(os.Args) < 2 {
 		if term.IsTerminal(int(os.Stdin.Fd())) {
 			interactiveMenu()
@@ -61,7 +65,11 @@ func main() {
 	}
 
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+		if internal.JSONMode {
+			internal.PrintErrorJSON(err.Error())
+		} else {
+			fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+		}
 		os.Exit(1)
 	}
 }
@@ -152,6 +160,25 @@ func usage() {
   sbm bwg status                               查看 GIA 带宽
   sbm bwg rotate                               手动流量均衡
   sbm client gen --upstream <URL> --platform <平台>  生成客户端配置
+  sbm metadata                                 查看元数据
   sbm serve                                    启动订阅 HTTPS 服务 (前台)
-  sbm version                                  版本信息`)
+  sbm version                                  版本信息
+
+全局选项:
+  --json          所有输出为 JSON (AI/自动化模式，无交互)
+  --force         跳过确认提示 (install 时自动包含于 --json)`)
+}
+
+// extractFlag scans args for a boolean flag, removes it, and returns (found, remaining).
+func extractFlag(args []string, flag string) (bool, []string) {
+	found := false
+	result := make([]string, 0, len(args))
+	for _, a := range args {
+		if a == flag {
+			found = true
+		} else {
+			result = append(result, a)
+		}
+	}
+	return found, result
 }

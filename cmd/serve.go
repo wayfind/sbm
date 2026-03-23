@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"sing-box-manager/internal"
 	"time"
 )
@@ -28,8 +29,8 @@ func RunServe(args []string) error {
 		listenPort = *port
 	}
 
-	certFile := internal.CertPath(meta.Domain)
-	keyFile := internal.CertKeyPath(meta.Domain)
+	// Try certbot cert first, fallback to sing-box ACME cert
+	certFile, keyFile := findCertFiles(meta.Domain)
 
 	// Topology store for aggregating downstream reports
 	topoStore := internal.NewTopoStore()
@@ -45,9 +46,14 @@ func RunServe(args []string) error {
 	mux.HandleFunc("/report", internal.BearerAuth(meta.APIToken, internal.HandleReport(topoStore)))
 
 	// Start topology reporter (reports to upstreams)
-	internal.StartTopologyReporter(meta, topoStore, 5*time.Minute)
+	internal.StartTopologyReporter(meta, topoStore, 30*time.Second)
 
-	// Start failover loop for entry nodes
+	// Topology-driven auto-config (entry + transit)
+	if meta.Role == internal.RoleEntry || meta.Role == internal.RoleTransit {
+		internal.StartReconcileLoop(meta, topoStore, 30*time.Second)
+	}
+
+	// BWG bandwidth balancing (entry only)
 	if meta.Role == internal.RoleEntry {
 		if failoverCfg, err := loadFailoverConfig(); err == nil && len(failoverCfg.Transits) > 0 {
 			internal.StartFailoverLoop(failoverCfg, 1*time.Hour)
@@ -100,4 +106,17 @@ func stripServerHeader(next http.Handler) http.Handler {
 		w.Header().Del("Server")
 		next.ServeHTTP(w, r)
 	})
+}
+
+// findCertFiles returns cert/key paths, preferring certbot over sing-box ACME.
+func findCertFiles(domain string) (certFile, keyFile string) {
+	if domain != "" {
+		// Certbot path
+		cb := "/etc/letsencrypt/live/" + domain
+		if _, err := os.Stat(cb + "/fullchain.pem"); err == nil {
+			return cb + "/fullchain.pem", cb + "/privkey.pem"
+		}
+	}
+	// Sing-box ACME path
+	return internal.CertPath(domain), internal.CertKeyPath(domain)
 }
