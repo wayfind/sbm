@@ -101,12 +101,14 @@ info "sing-box 版本: $SB_VER"
 # --- Download binaries ---
 download() {
     local name=$1 url=$2 dest=$3
+    local tmp="${dest}.new"
     if [ -f "$dest" ]; then
         info "$name 已存在，覆盖安装"
     fi
     info "下载 $name..."
-    curl -fsSL -o "$dest" "$url" || error "下载 $name 失败"
-    chmod +x "$dest"
+    curl -fsSL -o "$tmp" "$url" || { rm -f "$tmp"; error "下载 $name 失败"; }
+    chmod +x "$tmp"
+    mv -f "$tmp" "$dest" || { rm -f "$tmp"; error "安装 $name 失败 (mv)"; }
     info "$name 安装到 $dest"
 }
 
