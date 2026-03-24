@@ -2,6 +2,7 @@ package internal
 
 import (
 	"fmt"
+	"time"
 )
 
 // EntryParams holds parameters for generating entry node configuration.
@@ -297,13 +298,14 @@ func BuildEntryOutbounds(transits []TransitInfo, exits []ExitInfo) []interface{}
 		for i, e := range exits {
 			exitTags[i] = "exit-" + e.Name
 		}
+		// Daily sticky: pick one exit per day, rotate daily
+		// All AI traffic goes through the same exit IP for the entire day
+		todayExit := dailyStickyExit(exitTags)
 		outbounds = append(outbounds, map[string]interface{}{
-			"type":      "urltest",
+			"type":      "selector",
 			"tag":       "residential",
 			"outbounds": exitTags,
-			"url":       "https://www.gstatic.com/generate_204",
-			"interval":  "5m",
-			"tolerance": 200,
+			"default":   todayExit,
 		})
 	}
 
@@ -312,6 +314,26 @@ func BuildEntryOutbounds(transits []TransitInfo, exits []ExitInfo) []interface{}
 	)
 
 	return outbounds
+}
+
+// dailyStickyExit picks one exit tag deterministically based on today's date.
+// Same day = same exit. Rotates daily across available exits.
+func dailyStickyExit(exitTags []string) string {
+	if len(exitTags) == 0 {
+		return ""
+	}
+	if len(exitTags) == 1 {
+		return exitTags[0]
+	}
+	today := time.Now().Format("2006-01-02")
+	h := 0
+	for _, c := range today {
+		h = h*31 + int(c)
+	}
+	if h < 0 {
+		h = -h
+	}
+	return exitTags[h%len(exitTags)]
 }
 
 // BuildEntryRoute builds the route section for an entry node config.
