@@ -10,5 +10,9 @@ routes = [
 binding = "TOPO_KV"
 id = "84592dc002e048f789f6e14ce2571189"
 
+[[r2_buckets]]
+binding = "R2_BUCKET"
+bucket_name = "sbm-releases"
+
 [vars]
 API_KEY = "sbm-topo-k8xPmQ2vNfW7rYzJ"

@@ -2,9 +2,26 @@ package internal
 
 // GenerateTransitConfig generates a sing-box config for a transit node.
 // Transit nodes accept inbound connections (VLESS Reality + Hy2) and route to direct outbound.
+// No sniff needed: transit is a pure relay (final→direct), no routing decisions are made.
 func GenerateTransitConfig(p *InstallParams) *SBConfig {
-	rootDomain := ExtractRootDomain(p.Domain)
 	ignoreBW := true
+
+	// Hy2 TLS: prefer certbot certificate over ACME
+	hy2TLS := &SBTLS{
+		Enabled: true,
+		ALPN:    []string{"h3"},
+	}
+	if p.CertFile != "" {
+		hy2TLS.CertificatePath = p.CertFile
+		hy2TLS.KeyPath = p.KeyFile
+		if p.Domain != "" {
+			hy2TLS.ServerName = p.Domain
+		}
+	} else {
+		rootDomain := ExtractRootDomain(p.Domain)
+		hy2TLS.ACME = &SBACME{Domain: []string{p.Domain}, Email: "admin@" + rootDomain}
+	}
+
 	return &SBConfig{
 		Log: SBLog{Level: "warn", Timestamp: true},
 		Inbounds: []SBInbound{
@@ -29,11 +46,7 @@ func GenerateTransitConfig(p *InstallParams) *SBConfig {
 				Users:                 []SBUser{{Password: p.Hy2Pass}},
 				IgnoreClientBandwidth: &ignoreBW,
 				Obfs:                  &SBObfs{Type: "salamander", Password: p.ObfsPass},
-				TLS: &SBTLS{
-					Enabled: true,
-					ACME:    &SBACME{Domain: []string{p.Domain}, Email: "admin@" + rootDomain},
-					ALPN:    []string{"h3"},
-				},
+				TLS:                   hy2TLS,
 			},
 		},
 		Outbounds: []SBOutbound{{Type: "direct", Tag: "direct"}},

@@ -88,6 +88,9 @@ type Metadata struct {
 	ExitPorts      map[string]int    `json:"exit_ports,omitempty"`       // transit: exit_name → per-exit inbound port
 	ExitAuth       map[string]string `json:"exit_auth,omitempty"`        // transit: exit_name → per-exit socks auth password
 	ExitSocksPorts map[string]int    `json:"exit_socks_ports,omitempty"` // entry: exit_name → localhost socks5 port
+
+	// Transient field: Reality private key recovered from old config (not serialized)
+	PrivateKey string `json:"-"`
 }
 
 // LoadMetadata loads metadata.json with automatic v0→v2 migration.
@@ -254,11 +257,13 @@ type SBACME struct {
 }
 
 type SBTLS struct {
-	Enabled    bool       `json:"enabled"`
-	ServerName string     `json:"server_name,omitempty"`
-	Reality    *SBReality `json:"reality,omitempty"`
-	ACME       *SBACME    `json:"acme,omitempty"`
-	ALPN       []string   `json:"alpn,omitempty"`
+	Enabled         bool       `json:"enabled"`
+	ServerName      string     `json:"server_name,omitempty"`
+	CertificatePath string     `json:"certificate_path,omitempty"`
+	KeyPath         string     `json:"key_path,omitempty"`
+	Reality         *SBReality `json:"reality,omitempty"`
+	ACME            *SBACME    `json:"acme,omitempty"`
+	ALPN            []string   `json:"alpn,omitempty"`
 }
 
 type SBObfs struct {
@@ -301,6 +306,8 @@ type InstallParams struct {
 	ShortID    string
 	Hy2Pass    string
 	ObfsPass   string
+	CertFile   string // certbot certificate path (alternative to ACME)
+	KeyFile    string // certbot key path
 }
 
 // --- Helpers ---

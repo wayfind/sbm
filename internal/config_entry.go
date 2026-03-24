@@ -97,6 +97,7 @@ func GenerateEntryConfig(p *EntryParams) (map[string]interface{}, error) {
 	inbounds = append(inbounds, map[string]interface{}{
 		"type": "vless", "tag": "vless-in",
 		"listen": "::", "listen_port": p.VlessPort,
+		"sniff": true, "sniff_override_destination": true,
 		"users": vlessUsers,
 		"tls": map[string]interface{}{
 			"enabled":     true,
@@ -132,6 +133,7 @@ func GenerateEntryConfig(p *EntryParams) (map[string]interface{}, error) {
 		inbounds = append(inbounds, map[string]interface{}{
 			"type": "hysteria2", "tag": "hy2-in",
 			"listen": "::", "listen_port": p.Hy2Port,
+			"sniff": true, "sniff_override_destination": true,
 			"users":                   hy2Users,
 			"ignore_client_bandwidth": ignoreBW,
 			"obfs":                    map[string]interface{}{"type": "salamander", "password": p.ObfsPass},

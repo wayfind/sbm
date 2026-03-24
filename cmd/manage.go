@@ -9,20 +9,20 @@ import (
 )
 
 func RunStart() error {
-	return internal.SystemctlOp("start", "sing-box", "sub-server")
+	return internal.SystemctlOp("start", "sing-box", "sbm-server")
 }
 
 func RunStop() error {
-	return internal.SystemctlOp("stop", "sing-box", "sub-server")
+	return internal.SystemctlOp("stop", "sing-box", "sbm-server")
 }
 
 func RunRestart() error {
-	return internal.SystemctlOp("restart", "sing-box", "sub-server")
+	return internal.SystemctlOp("restart", "sing-box", "sbm-server")
 }
 
 func RunStatus() error {
 	singboxActive := internal.IsActive("sing-box")
-	subServerActive := internal.IsActive("sub-server")
+	sbmServerActive := internal.IsActive("sbm-server")
 
 	listeningPorts := collectListeningPorts()
 	firewallPorts := internal.FirewallListPorts()
@@ -31,7 +31,7 @@ func RunStatus() error {
 		internal.PrintJSON(map[string]interface{}{
 			"services": map[string]string{
 				"sing-box":   boolToStatus(singboxActive),
-				"sub-server": boolToStatus(subServerActive),
+				"sbm-server": boolToStatus(sbmServerActive),
 			},
 			"listening_ports": listeningPorts,
 			"firewall_ports":  firewallPorts,
@@ -41,7 +41,7 @@ func RunStatus() error {
 
 	fmt.Println("=== 服务状态 ===")
 	fmt.Printf("sing-box:   %s\n", boolToStatus(singboxActive))
-	fmt.Printf("sub-server: %s\n", boolToStatus(subServerActive))
+	fmt.Printf("sbm-server: %s\n", boolToStatus(sbmServerActive))
 	fmt.Println()
 
 	fmt.Println("=== 监听端口 ===")

@@ -20,9 +20,9 @@ RestartSec=10s
 WantedBy=multi-user.target
 `
 
-func subServerUnit(sbmPath string) string {
+func sbmServerUnit(sbmPath string) string {
 	return fmt.Sprintf(`[Unit]
-Description=Subscription Server
+Description=sbm server
 After=network.target sing-box.service
 
 [Service]
@@ -36,11 +36,19 @@ WantedBy=multi-user.target
 }
 
 func InstallSystemdUnits(sbmPath string) error {
+	// Migrate: remove legacy sub-server.service if present
+	const legacyUnit = "/etc/systemd/system/sub-server.service"
+	if _, err := os.Stat(legacyUnit); err == nil {
+		RunCmdSilent("systemctl", "stop", "sub-server")
+		RunCmdSilent("systemctl", "disable", "sub-server")
+		os.Remove(legacyUnit)
+	}
+
 	if err := os.WriteFile("/etc/systemd/system/sing-box.service", []byte(singboxUnit), 0644); err != nil {
 		return fmt.Errorf("write sing-box.service: %w", err)
 	}
-	if err := os.WriteFile("/etc/systemd/system/sub-server.service", []byte(subServerUnit(sbmPath)), 0644); err != nil {
-		return fmt.Errorf("write sub-server.service: %w", err)
+	if err := os.WriteFile("/etc/systemd/system/sbm-server.service", []byte(sbmServerUnit(sbmPath)), 0644); err != nil {
+		return fmt.Errorf("write sbm-server.service: %w", err)
 	}
 	return RunCmd("systemctl", "daemon-reload")
 }

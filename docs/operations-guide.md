@@ -123,7 +123,7 @@ for ib in c['inbounds']:
 
 ```bash
 ~/sing-box-manager/sbm status
-# sing-box: active, sub-server: active
+# sing-box: active, sbm-server: active
 
 ~/sing-box-manager/sbm sub
 # 应显示订阅地址和 vless/hy2 URI
@@ -169,7 +169,7 @@ sudo ~/sbm install --role exit --domain lisa.vspeak.top --force
 ### 3.3 重启使上游生效
 
 ```bash
-sudo systemctl restart sub-server
+sudo systemctl restart sbm-server
 ```
 
 ### 3.4 验证上报
@@ -273,7 +273,7 @@ sudo ~/sbm install --role entry --domain entry.vspeak.top --upstreams ~/upstream
 ```
 
 ```bash
-sudo systemctl restart sub-server
+sudo systemctl restart sbm-server
 ```
 
 ### 4.4 可选：配置 BWG 流量均衡
@@ -288,7 +288,7 @@ sudo cat > /etc/sing-box/failover.json << 'EOF'
   ]
 }
 EOF
-sudo systemctl restart sub-server
+sudo systemctl restart sbm-server
 ```
 
 ### 4.5 验证自动配置
@@ -361,7 +361,7 @@ sing-box run -c config.json
 # 在新家宽上安装
 sudo ~/sbm install --role exit --domain newexit.vspeak.top --force
 # 编辑 metadata 加 name + upstreams(指向transit) + api_token
-sudo systemctl restart sub-server
+sudo systemctl restart sbm-server
 ```
 
 **等 ~10 分钟。** 在 Entry 上验证：
@@ -390,7 +390,7 @@ sudo ~/sbm stop
 # 在新 GIA 上安装
 ~/sbm install --role transit --domain yl.vspeak.top --force
 # 编辑 metadata 加 name + upstreams(指向entry) + api_token
-sudo systemctl restart sub-server
+sudo systemctl restart sbm-server
 ```
 
 **等 ~10 分钟。** Entry 上 `sbm config` 确认 `transit-yl` 出现在 outbounds。
@@ -423,7 +423,7 @@ sbm start / stop / restart   # 服务管理
 | `/etc/sing-box/metadata.json` | sbm 元数据（角色、入站、上游、端口映射） |
 | `/etc/sing-box/failover.json` | BWG 均衡配置（entry 可选） |
 | `/etc/systemd/system/sing-box.service` | sing-box unit |
-| `/etc/systemd/system/sub-server.service` | 订阅+拓扑+reconcile 服务 unit |
+| `/etc/systemd/system/sbm-server.service` | 订阅+拓扑+reconcile 服务 unit |
 | `/etc/cron.d/renew-cert` | 证书续期 cron |
 
 ---
@@ -451,7 +451,7 @@ sbm logs -n 200 | grep -E '\[reconcile\]|\[topology\]|\[failover\]'
 # 拓扑不更新
 # → 检查 api_token 两端是否一致
 # → 检查 upstreams 配置是否正确
-# → 检查 sub-server 是否运行: sbm status
+# → 检查 sbm-server 是否运行: sbm status
 
 # per-exit 通道不出现
 # → Transit 上: sbm topology --json | python3 -c "import json,sys; print(json.dumps(json.load(sys.stdin),indent=2))"
@@ -487,7 +487,7 @@ Transit × N:
 Exit × N:
 □ sbm install --role exit --domain <域名> --force
 □ 编辑 metadata: name + api_token + upstreams(→transit)
-□ systemctl restart sub-server
+□ systemctl restart sbm-server
 □ Transit 上 sbm topology 确认 exit 出现
 □ 等 5 分钟, Transit 上确认 per-exit 入站+出站生成
 
@@ -495,7 +495,7 @@ Entry:
 □ 准备 upstreams.json (transit 信息, exits 留空)
 □ sbm install --role entry --domain <域名> --upstreams xxx.json --force
 □ 回每台 Transit 编辑 metadata 加 upstreams(→entry)
-□ 每台 Transit: systemctl restart sub-server
+□ 每台 Transit: systemctl restart sbm-server
 □ 可选: 创建 failover.json
 □ 等 10 分钟, sbm topology 确认完整链路
 □ 确认 per-exit SOCKS5 入站自动创建

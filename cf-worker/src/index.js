@@ -25,12 +25,91 @@ h1{color:#58a6ff;margin-bottom:4px}
 .status-warn{background:#9e6a03;color:#fff}
 .status-err{background:#da3633;color:#fff}
 #updated{color:#484f58;font-size:12px;text-align:right}
+.install-section{margin-top:24px;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:20px}
+.install-section h2{color:#58a6ff;margin:0 0 12px;font-size:18px}
+.install-section p{color:#8b949e;margin:4px 0;font-size:13px}
+.cmd{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:10px 14px;font-family:monospace;font-size:13px;color:#7ee787;margin:8px 0;position:relative;cursor:pointer;display:flex;align-items:center;justify-content:space-between}
+.cmd:hover{border-color:#58a6ff}
+.cmd .copy-btn{color:#484f58;font-size:11px;white-space:nowrap;margin-left:12px}
+.cmd:hover .copy-btn{color:#58a6ff}
+.cmd-label{color:#8b949e;font-size:12px;margin-top:12px;margin-bottom:2px}
+.tab-bar{display:flex;gap:0;margin-bottom:16px;border-bottom:1px solid #30363d}
+.tab{padding:8px 16px;font-size:13px;color:#8b949e;cursor:pointer;border-bottom:2px solid transparent;transition:all .15s}
+.tab:hover{color:#e6edf3}
+.tab.active{color:#58a6ff;border-bottom-color:#58a6ff}
+.tab-content{display:none}
+.tab-content.active{display:block}
 </style></head><body>
 <h1>sbm 全网拓扑</h1>
 <div class="subtitle" id="updated"></div>
 <div class="status-bar" id="status"></div>
 <div class="grid" id="nodes"></div>
+
+<div class="install-section">
+<h2>快速安装</h2>
+<p>一条命令部署节点 — 自动下载 sbm + sing-box，配置并启动服务</p>
+
+<div class="tab-bar">
+  <div class="tab active" onclick="showTab('transit',this)">传输节点</div>
+  <div class="tab" onclick="showTab('exit',this)">出口节点</div>
+  <div class="tab" onclick="showTab('entry',this)">接入节点</div>
+  <div class="tab" onclick="showTab('download',this)">仅下载</div>
+</div>
+
+<div id="tab-transit" class="tab-content active">
+  <p>CN2 GIA 传输节点，需要域名已解析到本机</p>
+  <div class="cmd-label">安装命令</div>
+  <div class="cmd" onclick="copyCmd(this)">
+    <span>curl -fsSL https://tun.vspeak.top/install | bash -s -- --role transit --domain &lt;域名&gt;</span>
+    <span class="copy-btn">点击复制</span>
+  </div>
+</div>
+
+<div id="tab-exit" class="tab-content">
+  <p>家宽出口节点，无需域名</p>
+  <div class="cmd-label">安装命令</div>
+  <div class="cmd" onclick="copyCmd(this)">
+    <span>curl -fsSL https://tun.vspeak.top/install | bash -s -- --role exit</span>
+    <span class="copy-btn">点击复制</span>
+  </div>
+</div>
+
+<div id="tab-entry" class="tab-content">
+  <p>国内云接入节点，需要域名和上游配置文件</p>
+  <div class="cmd-label">安装命令</div>
+  <div class="cmd" onclick="copyCmd(this)">
+    <span>curl -fsSL https://tun.vspeak.top/install | bash -s -- --role entry --domain &lt;域名&gt; --upstreams &lt;文件&gt;</span>
+    <span class="copy-btn">点击复制</span>
+  </div>
+</div>
+
+<div id="tab-download" class="tab-content">
+  <p>仅下载 sbm + sing-box 到 /usr/local/bin/，不配置节点</p>
+  <div class="cmd-label">下载命令</div>
+  <div class="cmd" onclick="copyCmd(this)">
+    <span>curl -fsSL https://tun.vspeak.top/install | bash -s -- --download-only</span>
+    <span class="copy-btn">点击复制</span>
+  </div>
+</div>
+
+<p style="margin-top:16px;color:#484f58;font-size:12px">安装后编辑 /etc/sing-box/metadata.json 添加 name 和 api_token，然后 sbm status 验证</p>
+</div>
+
 <script>
+function showTab(name,el){
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(t=>t.classList.remove('active'));
+  el.classList.add('active');
+  document.getElementById('tab-'+name).classList.add('active');
+}
+function copyCmd(el){
+  const text=el.querySelector('span').textContent;
+  navigator.clipboard.writeText(text).then(()=>{
+    const btn=el.querySelector('.copy-btn');
+    btn.textContent='已复制!';
+    setTimeout(()=>btn.textContent='点击复制',1500);
+  });
+}
 const token=new URLSearchParams(location.search).get('token')||'';
 function ago(ts){
   const s=Math.floor((Date.now()-new Date(ts))/1000);
@@ -129,6 +208,31 @@ export default {
       const id = path.slice(7);
       await env.TOPO_KV.delete(id);
       return Response.json({ status: "ok" });
+    }
+
+    // --- R2 release downloads (public, no auth) ---
+
+    // GET /install — serve install script
+    if (request.method === "GET" && path === "/install") {
+      const obj = await env.R2_BUCKET.get("releases/install.sh");
+      if (!obj) return new Response("install.sh not found", { status: 404 });
+      return new Response(obj.body, {
+        headers: { "Content-Type": "text/plain; charset=utf-8" },
+      });
+    }
+
+    // GET /releases/* — proxy R2 objects
+    if (request.method === "GET" && path.startsWith("/releases/")) {
+      const key = path.slice(1); // "releases/..."
+      const obj = await env.R2_BUCKET.get(key);
+      if (!obj) return new Response("not found", { status: 404 });
+      const contentType = key.endsWith(".json") ? "application/json" : "application/octet-stream";
+      return new Response(obj.body, {
+        headers: {
+          "Content-Type": contentType,
+          "Cache-Control": "public, max-age=300",
+        },
+      });
     }
 
     return Response.json({ error: "not found" }, { status: 404 });

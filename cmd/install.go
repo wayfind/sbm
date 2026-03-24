@@ -80,21 +80,25 @@ func RunInstall(args []string) error {
 // --- Shared install helpers ---
 
 // prepareInstall checks prerequisites, handles existing deployment backup, and creates deploy dir.
-// Returns false if user cancelled.
-func prepareInstall(f *InstallFlags) (bool, error) {
+// Returns: ok (false if cancelled), oldMeta (if existing deployment found), err.
+func prepareInstall(f *InstallFlags) (bool, *internal.Metadata, error) {
 	if _, err := exec.LookPath("sing-box"); err != nil {
-		return false, fmt.Errorf("sing-box not found，请先安装 sing-box")
+		return false, nil, fmt.Errorf("sing-box not found，请先安装 sing-box")
 	}
+
+	var savedMeta *internal.Metadata
 
 	if _, err := os.Stat(internal.DeployDir); err == nil {
 		if !f.Force {
 			fmt.Printf("检测到现有部署: %s\n", internal.DeployDir)
 			if !promptConfirm("是否替换现有部署？") {
 				fmt.Println("取消安装")
-				return false, nil
+				return false, nil, nil
 			}
 		}
+		// Save metadata and config before backup
 		if oldMeta, err := internal.LoadMetadata(); err == nil {
+			savedMeta = oldMeta
 			humanPrint("清理旧防火墙规则...\n")
 			for _, inb := range oldMeta.Inbounds {
 				internal.FirewallRemovePort(inb.Port, inb.Transport)
@@ -106,14 +110,20 @@ func prepareInstall(f *InstallFlags) (bool, error) {
 			internal.FirewallRemovePort(oldSubPort, "tcp")
 			internal.FirewallReload()
 		}
+		// Read Reality private key from old config before backup
+		if savedMeta != nil {
+			if privKey := extractPrivateKeyFromConfig(); privKey != "" {
+				savedMeta.PrivateKey = privKey
+			}
+		}
 		backup := fmt.Sprintf("/etc/sing-box.backup-%s", time.Now().Format("20060102-150405"))
 		humanPrint("备份到: %s\n", backup)
-		internal.SystemctlOp("stop", "sing-box", "sub-server")
-		internal.SystemctlOp("disable", "sing-box", "sub-server")
+		internal.SystemctlOp("stop", "sing-box", "sbm-server")
+		internal.SystemctlOp("disable", "sing-box", "sbm-server")
 		os.Rename(internal.DeployDir, backup)
 	}
 	os.MkdirAll(internal.DeployDir, 0755)
-	return true, nil
+	return true, savedMeta, nil
 }
 
 func generateCryptoMaterials() (*cryptoMaterials, error) {
@@ -144,12 +154,17 @@ func generateCryptoMaterials() (*cryptoMaterials, error) {
 	}, nil
 }
 
-func assignPorts(f *InstallFlags) {
+func assignPorts(f *InstallFlags, role internal.NodeRole) {
+	// Entry inbound ports start above SubPort to avoid conflicts
+	min, max := 10000, 60000
+	if role == internal.RoleEntry {
+		min, max = f.SubPort+2, 29999
+	}
 	if f.VlessPort == 0 {
-		f.VlessPort = findAvailablePort(10000, 60000)
+		f.VlessPort = findAvailablePort(min, max)
 	}
 	if f.Hy2Port == 0 {
-		f.Hy2Port = findAvailablePort(10000, 60000, f.VlessPort)
+		f.Hy2Port = findAvailablePort(min, max, f.VlessPort)
 	}
 }
 
@@ -188,7 +203,7 @@ func finishInstall(f *InstallFlags, role internal.NodeRole, extraTCPPorts ...int
 	}
 	internal.FirewallReload()
 
-	internal.SystemctlOp("enable", "--now", "sing-box", "sub-server")
+	internal.SystemctlOp("enable", "--now", "sing-box", "sbm-server")
 
 	if role != internal.RoleExit {
 		humanPrint("等待 ACME 证书签发...\n")
@@ -216,6 +231,7 @@ func buildInstallParams(f *InstallFlags, cm *cryptoMaterials) *internal.InstallP
 		Domain: f.Domain, VlessPort: f.VlessPort, Hy2Port: f.Hy2Port,
 		SubPort: f.SubPort, UUID: cm.UUID, PrivateKey: cm.PrivateKey, PublicKey: cm.PublicKey,
 		ShortID: cm.ShortID, Hy2Pass: cm.Hy2Pass, ObfsPass: cm.ObfsPass,
+		CertFile: f.CertFile, KeyFile: f.KeyFile,
 	}
 }
 
@@ -228,7 +244,7 @@ func installServerNode(role internal.NodeRole, f *InstallFlags) error {
 	}[role]
 	humanPrint("=== sing-box %s部署 ===\n", roleLabel)
 
-	ok, err := prepareInstall(f)
+	ok, oldMeta, err := prepareInstall(f)
 	if err != nil {
 		return err
 	}
@@ -239,12 +255,14 @@ func installServerNode(role internal.NodeRole, f *InstallFlags) error {
 	if f.Domain != "" {
 		humanPrint("域名: %s\n", f.Domain)
 	}
-	humanPrint("生成密钥...\n")
-	cm, err := generateCryptoMaterials()
+
+	// Recover crypto from old deployment or generate new
+	cm, err := resolveOrGenerateCrypto(f, oldMeta)
 	if err != nil {
 		return err
 	}
-	assignPorts(f)
+	assignPorts(f, role)
+	detectCertbot(f)
 	humanPrint("VLESS Reality 端口: %d\n", f.VlessPort)
 
 	params := buildInstallParams(f, cm)
@@ -281,6 +299,9 @@ func installServerNode(role internal.NodeRole, f *InstallFlags) error {
 		Domain: f.Domain, SubPort: f.SubPort,
 		Inbounds: inboundMetas,
 	}
+	if oldMeta != nil {
+		restoreMetaFields(meta, oldMeta)
+	}
 	if err := meta.Save(); err != nil {
 		return fmt.Errorf("save metadata: %w", err)
 	}
@@ -307,7 +328,7 @@ func installServerNode(role internal.NodeRole, f *InstallFlags) error {
 		fmt.Printf("\n=== %s部署完成 ===\n", roleLabel)
 		fmt.Printf("角色:       %s\n", role)
 		fmt.Printf("sing-box:   %s\n", activeStr("sing-box"))
-		fmt.Printf("sub-server: %s\n", activeStr("sub-server"))
+		fmt.Printf("sbm-server: %s\n", activeStr("sbm-server"))
 		fmt.Printf("VLESS:      %d/tcp\n", f.VlessPort)
 		if role == internal.RoleTransit {
 			fmt.Printf("Hysteria2:  %d/udp\n", f.Hy2Port)
@@ -355,7 +376,7 @@ func installEntryNode(f *InstallFlags) error {
 		return fmt.Errorf("upstreams 配置必须包含至少一个 transit 节点")
 	}
 
-	ok, err := prepareInstall(f)
+	ok, oldMeta, err := prepareInstall(f)
 	if err != nil {
 		return err
 	}
@@ -364,16 +385,19 @@ func installEntryNode(f *InstallFlags) error {
 	}
 
 	humanPrint("域名: %s\n", f.Domain)
-	humanPrint("生成密钥...\n")
-	cm, err := generateCryptoMaterials()
+
+	// Recover crypto from old deployment or generate new
+	cm, err := resolveOrGenerateCrypto(f, oldMeta)
 	if err != nil {
 		return err
 	}
-	assignPorts(f)
+	assignPorts(f, internal.RoleEntry)
 	humanPrint("VLESS Reality 端口: %d\n", f.VlessPort)
 	humanPrint("Hysteria2 端口: %d\n", f.Hy2Port)
 	humanPrint("Transit 上游: %d 个\n", len(upCfg.Transits))
 	humanPrint("Exit 上游: %d 个\n", len(upCfg.Exits))
+
+	detectCertbot(f)
 
 	// Entry config
 	entryParams := &internal.EntryParams{
@@ -420,6 +444,9 @@ func installEntryNode(f *InstallFlags) error {
 		Domain: f.Domain, SubPort: f.SubPort,
 		Inbounds: inboundMetas, Upstreams: upstreamMetas,
 	}
+	if oldMeta != nil {
+		restoreMetaFields(meta, oldMeta)
+	}
 	if err := meta.Save(); err != nil {
 		return fmt.Errorf("save metadata: %w", err)
 	}
@@ -445,7 +472,7 @@ func installEntryNode(f *InstallFlags) error {
 		fmt.Printf("\n=== 接入节点部署完成 ===\n")
 		fmt.Printf("角色:       entry\n")
 		fmt.Printf("sing-box:   %s\n", activeStr("sing-box"))
-		fmt.Printf("sub-server: %s\n", activeStr("sub-server"))
+		fmt.Printf("sbm-server: %s\n", activeStr("sbm-server"))
 		fmt.Printf("VLESS:      %d/tcp\n", f.VlessPort)
 		fmt.Printf("Hysteria2:  %d/udp\n", f.Hy2Port)
 		if upCfg.Socks5 != nil && upCfg.Socks5.Port > 0 {
@@ -459,6 +486,108 @@ func installEntryNode(f *InstallFlags) error {
 }
 
 // --- Helpers ---
+
+// extractPrivateKeyFromConfig reads the Reality private_key from the existing sing-box config.
+// This is needed because metadata only stores the public key, not the private key.
+func extractPrivateKeyFromConfig() string {
+	data, err := os.ReadFile(internal.DeployDir + "/config.json")
+	if err != nil {
+		return ""
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return ""
+	}
+	inbounds, _ := raw["inbounds"].([]interface{})
+	for _, ib := range inbounds {
+		ibMap, _ := ib.(map[string]interface{})
+		tls, _ := ibMap["tls"].(map[string]interface{})
+		reality, _ := tls["reality"].(map[string]interface{})
+		if pk, ok := reality["private_key"].(string); ok && pk != "" {
+			return pk
+		}
+	}
+	return ""
+}
+
+// resolveOrGenerateCrypto recovers crypto from old metadata or generates new materials.
+// Also restores old ports into InstallFlags if not explicitly specified.
+func resolveOrGenerateCrypto(f *InstallFlags, oldMeta *internal.Metadata) (*cryptoMaterials, error) {
+	if oldMeta != nil {
+		if cm := recoverCrypto(oldMeta); cm != nil {
+			humanPrint("复用现有密钥\n")
+			// Reuse old ports if not explicitly specified
+			for _, inb := range oldMeta.Inbounds {
+				if inb.Protocol == "vless" && f.VlessPort == 0 {
+					f.VlessPort = inb.Port
+				}
+				if inb.Protocol == "hysteria2" && f.Hy2Port == 0 {
+					f.Hy2Port = inb.Port
+				}
+			}
+			return cm, nil
+		}
+	}
+	humanPrint("生成密钥...\n")
+	return generateCryptoMaterials()
+}
+
+// recoverCrypto extracts cryptographic materials from old metadata + private key.
+// Returns nil if recovery is not possible (missing critical fields).
+func recoverCrypto(oldMeta *internal.Metadata) *cryptoMaterials {
+	var cm cryptoMaterials
+	for _, inb := range oldMeta.Inbounds {
+		switch inb.Protocol {
+		case "vless":
+			cm.PublicKey = inb.PublicKey
+			cm.ShortID = inb.ShortID
+			cm.UUID = inb.UUID
+		case "hysteria2":
+			cm.Hy2Pass = inb.Password
+			cm.ObfsPass = inb.ObfsPass
+		}
+	}
+	cm.PrivateKey = oldMeta.PrivateKey
+
+	// Validate: must have at least UUID and PrivateKey
+	if cm.UUID == "" || cm.PrivateKey == "" {
+		return nil
+	}
+	return &cm
+}
+
+// restoreMetaFields copies operational fields from old metadata to new metadata.
+func restoreMetaFields(meta *internal.Metadata, old *internal.Metadata) {
+	if old.NodeID != "" {
+		meta.NodeID = old.NodeID
+	}
+	meta.Name = old.Name
+	meta.APIToken = old.APIToken
+	meta.CFWorkerURL = old.CFWorkerURL
+	meta.CFAPIKey = old.CFAPIKey
+	meta.BWG = old.BWG
+	if old.ExitPorts != nil {
+		meta.ExitPorts = old.ExitPorts
+	}
+	if old.ExitAuth != nil {
+		meta.ExitAuth = old.ExitAuth
+	}
+	if old.ExitSocksPorts != nil {
+		meta.ExitSocksPorts = old.ExitSocksPorts
+	}
+}
+
+// detectCertbot auto-detects certbot certificates for the domain.
+func detectCertbot(f *InstallFlags) {
+	if f.CertFile == "" && f.Domain != "" {
+		cb := "/etc/letsencrypt/live/" + f.Domain
+		if _, err := os.Stat(cb + "/fullchain.pem"); err == nil {
+			f.CertFile = cb + "/fullchain.pem"
+			f.KeyFile = cb + "/privkey.pem"
+			humanPrint("检测到 certbot 证书: %s\n", cb)
+		}
+	}
+}
 
 func findAvailablePort(min, max int, exclude ...int) int {
 	for i := 0; i < 100; i++ {
