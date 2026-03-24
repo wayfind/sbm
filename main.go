@@ -58,6 +58,8 @@ func main() {
 		err = cmd.RunMetadata()
 	case "version", "-v", "--version":
 		err = cmd.RunVersion()
+	case "update":
+		err = cmd.RunUpdate(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -165,6 +167,7 @@ func usage() {
   sbm user add/del/list/set-quota/enable/disable    用户管理
   sbm metadata                                 查看元数据
   sbm serve                                    启动订阅 HTTPS 服务 (前台)
+  sbm update                                   自更新 sbm 二进制
   sbm version                                  版本信息
 
 全局选项:
