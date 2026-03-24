@@ -2,7 +2,6 @@ package internal
 
 import (
 	"fmt"
-	"time"
 )
 
 // EntryParams holds parameters for generating entry node configuration.
@@ -316,24 +315,15 @@ func BuildEntryOutbounds(transits []TransitInfo, exits []ExitInfo) []interface{}
 	return outbounds
 }
 
-// dailyStickyExit picks one exit tag deterministically based on today's date.
-// Same day = same exit. Rotates daily across available exits.
+// dailyStickyExit picks the first exit tag as default.
+// Sticky: stays on the same exit until it goes offline.
+// When an exit goes offline, reconcile removes it from the list,
+// and the next available exit becomes the new default.
 func dailyStickyExit(exitTags []string) string {
 	if len(exitTags) == 0 {
 		return ""
 	}
-	if len(exitTags) == 1 {
-		return exitTags[0]
-	}
-	today := time.Now().Format("2006-01-02")
-	h := 0
-	for _, c := range today {
-		h = h*31 + int(c)
-	}
-	if h < 0 {
-		h = -h
-	}
-	return exitTags[h%len(exitTags)]
+	return exitTags[0]
 }
 
 // BuildEntryRoute builds the route section for an entry node config.
