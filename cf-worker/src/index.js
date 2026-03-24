@@ -170,7 +170,32 @@ export default {
       });
     }
 
-    // API auth
+    // --- R2 release downloads (public, no auth) ---
+
+    // GET /install — serve install script
+    if (request.method === "GET" && path === "/install") {
+      const obj = await env.R2_BUCKET.get("releases/install.sh");
+      if (!obj) return new Response("install.sh not found", { status: 404 });
+      return new Response(obj.body, {
+        headers: { "Content-Type": "text/plain; charset=utf-8" },
+      });
+    }
+
+    // GET /releases/* — proxy R2 objects
+    if (request.method === "GET" && path.startsWith("/releases/")) {
+      const key = path.slice(1); // "releases/..."
+      const obj = await env.R2_BUCKET.get(key);
+      if (!obj) return new Response("not found", { status: 404 });
+      const contentType = key.endsWith(".json") ? "application/json" : "application/octet-stream";
+      return new Response(obj.body, {
+        headers: {
+          "Content-Type": contentType,
+          "Cache-Control": "public, max-age=300",
+        },
+      });
+    }
+
+    // API auth (everything below requires authentication)
     const apiKey = env.API_KEY;
     const given = request.headers.get("X-API-Key") || url.searchParams.get("token") || "";
     if (!apiKey || given !== apiKey) {
@@ -208,31 +233,6 @@ export default {
       const id = path.slice(7);
       await env.TOPO_KV.delete(id);
       return Response.json({ status: "ok" });
-    }
-
-    // --- R2 release downloads (public, no auth) ---
-
-    // GET /install — serve install script
-    if (request.method === "GET" && path === "/install") {
-      const obj = await env.R2_BUCKET.get("releases/install.sh");
-      if (!obj) return new Response("install.sh not found", { status: 404 });
-      return new Response(obj.body, {
-        headers: { "Content-Type": "text/plain; charset=utf-8" },
-      });
-    }
-
-    // GET /releases/* — proxy R2 objects
-    if (request.method === "GET" && path.startsWith("/releases/")) {
-      const key = path.slice(1); // "releases/..."
-      const obj = await env.R2_BUCKET.get(key);
-      if (!obj) return new Response("not found", { status: 404 });
-      const contentType = key.endsWith(".json") ? "application/json" : "application/octet-stream";
-      return new Response(obj.body, {
-        headers: {
-          "Content-Type": contentType,
-          "Cache-Control": "public, max-age=300",
-        },
-      });
     }
 
     return Response.json({ error: "not found" }, { status: 404 });

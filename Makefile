@@ -15,11 +15,11 @@ fetch-singbox:
 
 # Publish sbm + sing-box + install.sh to CF R2
 publish: build fetch-singbox
-	cd cf-worker && npx wrangler r2 object put sbm-releases/releases/sbm/v$(VERSION)/sbm-linux-amd64 --file=../sbm
-	cd cf-worker && npx wrangler r2 object put sbm-releases/releases/sing-box/$(SINGBOX_VERSION)/sing-box-linux-amd64 --file=../sing-box-linux-amd64
+	cd cf-worker && npx wrangler r2 object put sbm-releases/releases/sbm/v$(VERSION)/sbm-linux-amd64 --file=../sbm --remote
+	cd cf-worker && npx wrangler r2 object put sbm-releases/releases/sing-box/$(SINGBOX_VERSION)/sing-box-linux-amd64 --file=../sing-box-linux-amd64 --remote
 	@echo '{"sbm":"$(VERSION)","sing_box":"$(SINGBOX_VERSION)"}' > /tmp/latest.json
-	cd cf-worker && npx wrangler r2 object put sbm-releases/releases/latest.json --file=/tmp/latest.json
-	cd cf-worker && npx wrangler r2 object put sbm-releases/releases/install.sh --file=../scripts/install.sh
+	cd cf-worker && npx wrangler r2 object put sbm-releases/releases/latest.json --file=/tmp/latest.json --remote
+	cd cf-worker && npx wrangler r2 object put sbm-releases/releases/install.sh --file=../scripts/install.sh --remote
 	@echo "Published sbm v$(VERSION) + sing-box $(SINGBOX_VERSION) to R2"
 
 # Deploy Worker
