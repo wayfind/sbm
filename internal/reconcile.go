@@ -1,7 +1,6 @@
 package internal
 
 import (
-	"crypto/sha256"
 	"encoding/json"
 	"log"
 	"os"
@@ -14,23 +13,21 @@ import (
 // ConfigMu protects concurrent read-modify-write of sing-box config.json.
 var ConfigMu sync.Mutex
 
-// StartReconcileLoop starts periodic reconciliation for entry or transit nodes.
-// Uses CF as primary topology source, falls back to local TopoStore.
+// StartReconcileLoop starts periodic reconciliation.
+// Entry: auto-configure transit/exit outbounds from topology.
+// Transit: only reports to CF (no config changes needed — pure relay).
 func StartReconcileLoop(meta *Metadata, store *TopoStore, cfClient *CFTopoClient, interval time.Duration) {
+	if meta.Role != RoleEntry {
+		log.Printf("[reconcile] role=%s, no reconcile needed (transit is pure relay)", meta.Role)
+		return
+	}
+
 	go func() {
 		time.Sleep(10 * time.Second)
 
 		for {
 			downstreams := getTopoFromDualView(meta, store, cfClient)
-
-			var err error
-			switch meta.Role {
-			case RoleEntry:
-				err = ReconcileEntryConfig(meta, downstreams)
-			case RoleTransit:
-				err = ReconcileTransitConfig(meta, downstreams)
-			}
-			if err != nil {
+			if err := ReconcileEntryConfig(meta, downstreams); err != nil {
 				log.Printf("[reconcile] error: %v", err)
 			}
 			time.Sleep(interval)
@@ -55,7 +52,7 @@ func getTopoFromDualView(meta *Metadata, store *TopoStore, cfClient *CFTopoClien
 
 	cfDownstreams := cfNodesToDownstreams(cfNodes, meta)
 
-	// Consistency check
+	// Consistency check (only compare relevant roles)
 	cfIDs := map[string]bool{}
 	for _, d := range cfDownstreams {
 		cfIDs[d.Self.NodeID] = true
@@ -78,10 +75,10 @@ func getTopoFromDualView(meta *Metadata, store *TopoStore, cfClient *CFTopoClien
 	return cfDownstreams
 }
 
-// cfNodesToDownstreams converts flat CF node list into topology trees.
+// cfNodesToDownstreams converts flat CF node list into topology trees for Entry.
+// Every exit is placed under every transit (full-mesh: any transit can reach any exit via detour).
 func cfNodesToDownstreams(nodes []NodeInfo, meta *Metadata) []TopologyTree {
-	transitNodes := []NodeInfo{}
-	exitNodes := []NodeInfo{}
+	var transitNodes, exitNodes []NodeInfo
 	for _, n := range nodes {
 		if n.NodeID == meta.NodeID {
 			continue
@@ -94,30 +91,19 @@ func cfNodesToDownstreams(nodes []NodeInfo, meta *Metadata) []TopologyTree {
 		}
 	}
 
-	switch meta.Role {
-	case RoleEntry:
-		var result []TopologyTree
-		for _, t := range transitNodes {
-			tree := TopologyTree{Self: t}
-			for _, e := range exitNodes {
-				tree.Downstreams = append(tree.Downstreams, TopologyTree{Self: e})
-			}
-			result = append(result, tree)
-		}
-		return result
-	case RoleTransit:
-		var result []TopologyTree
+	var result []TopologyTree
+	for _, t := range transitNodes {
+		tree := TopologyTree{Self: t}
 		for _, e := range exitNodes {
-			result = append(result, TopologyTree{Self: e})
+			tree.Downstreams = append(tree.Downstreams, TopologyTree{Self: e})
 		}
-		return result
-	default:
-		return nil
+		result = append(result, tree)
 	}
+	return result
 }
 
 // =============================================================================
-// Entry reconcile
+// Entry reconcile — transit outbounds + exit outbounds (detour) + per-exit SOCKS5
 // =============================================================================
 
 func ReconcileEntryConfig(meta *Metadata, downstreams []TopologyTree) error {
@@ -127,14 +113,14 @@ func ReconcileEntryConfig(meta *Metadata, downstreams []TopologyTree) error {
 
 	desiredTransits := topoToTransits(downstreams)
 	desiredExits := topoToExits(downstreams)
-	perExitChannels := topoToPerExitChannels(downstreams)
 
 	if len(desiredTransits) == 0 {
 		log.Println("[reconcile] no alive transits, skipping")
 		return nil
 	}
 
-	portsChanged := assignExitSocksPorts(meta, perExitChannels)
+	// Assign per-exit SOCKS5 ports (localhost, for application-layer routing)
+	portsChanged := assignExitSocksPorts(meta, desiredExits)
 
 	ConfigMu.Lock()
 	defer ConfigMu.Unlock()
@@ -144,14 +130,13 @@ func ReconcileEntryConfig(meta *Metadata, downstreams []TopologyTree) error {
 		return err
 	}
 
-	if !entryConfigNeedsUpdate(data, desiredTransits, desiredExits, perExitChannels, meta) && !portsChanged {
+	if !entryConfigNeedsUpdate(data, desiredTransits, desiredExits, meta) && !portsChanged {
 		return nil
 	}
 
-	log.Printf("[reconcile] entry update: %d transits, %d exits, %d per-exit channels",
-		len(desiredTransits), len(desiredExits), len(perExitChannels))
+	log.Printf("[reconcile] entry update: %d transits, %d exits", len(desiredTransits), len(desiredExits))
 
-	newData, err := rebuildEntryConfig(data, meta, desiredTransits, desiredExits, perExitChannels)
+	newData, err := rebuildEntryConfig(data, meta, desiredTransits, desiredExits)
 	if err != nil {
 		return err
 	}
@@ -165,473 +150,9 @@ func ReconcileEntryConfig(meta *Metadata, downstreams []TopologyTree) error {
 	return validateAndApplyConfig(newData, "[reconcile-entry]")
 }
 
-// PerExitChannel represents a per-exit channel on a transit node.
-type PerExitChannel struct {
-	ExitName       string
-	TransitName    string
-	TransitAddress string
-	Port           int
-	Username       string
-	Password       string
-}
-
-func topoToPerExitChannels(downstreams []TopologyTree) []PerExitChannel {
-	var result []PerExitChannel
-	for _, transit := range downstreams {
-		if !transit.Self.Alive || transit.Self.Role != RoleTransit {
-			continue
-		}
-		addr := transit.Self.Domain
-		if addr == "" {
-			addr = transit.Self.Address
-		}
-		for _, inb := range transit.Self.Inbounds {
-			if inb.ForExit != "" {
-				result = append(result, PerExitChannel{
-					ExitName:       inb.ForExit,
-					TransitName:    transit.Self.Name,
-					TransitAddress: addr,
-					Port:           inb.Port,
-					Username:       inb.Username,
-					Password:       inb.Password,
-				})
-			}
-		}
-	}
-	sort.Slice(result, func(i, j int) bool { return result[i].ExitName < result[j].ExitName })
-	return result
-}
-
-func assignExitSocksPorts(meta *Metadata, channels []PerExitChannel) bool {
-	if meta.ExitSocksPorts == nil {
-		meta.ExitSocksPorts = make(map[string]int)
-	}
-	changed := false
-	for _, ch := range channels {
-		if _, exists := meta.ExitSocksPorts[ch.ExitName]; !exists {
-			port := AllocatePort(10800, 10900, meta.ExitSocksPorts)
-			meta.ExitSocksPorts[ch.ExitName] = port
-			changed = true
-			log.Printf("[reconcile] assigned socks5 port %d for exit %s", port, ch.ExitName)
-		}
-	}
-	activeExits := map[string]bool{}
-	for _, ch := range channels {
-		activeExits[ch.ExitName] = true
-	}
-	for name := range meta.ExitSocksPorts {
-		if !activeExits[name] {
-			delete(meta.ExitSocksPorts, name)
-			changed = true
-		}
-	}
-	return changed
-}
-
-func entryConfigNeedsUpdate(configData []byte, transits []TransitInfo, exits []ExitInfo, channels []PerExitChannel, meta *Metadata) bool {
-	var config map[string]interface{}
-	if err := json.Unmarshal(configData, &config); err != nil {
-		return true
-	}
-
-	outbounds, ok := config["outbounds"].([]interface{})
-	if !ok {
-		return true
-	}
-	currentTags := map[string]bool{}
-	for _, ob := range outbounds {
-		obMap, ok := ob.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		if tag, ok := obMap["tag"].(string); ok {
-			currentTags[tag] = true
-		}
-	}
-
-	desiredTags := map[string]bool{"gia-auto": true, "direct": true}
-	for _, t := range transits {
-		desiredTags["transit-"+t.Name] = true
-	}
-	for _, e := range exits {
-		desiredTags["exit-"+e.Name] = true
-	}
-	if len(exits) > 0 {
-		desiredTags["residential"] = true
-	}
-	for _, ch := range channels {
-		desiredTags["via-transit-exit-"+ch.ExitName] = true
-	}
-
-	if len(currentTags) != len(desiredTags) {
-		return true
-	}
-	for tag := range desiredTags {
-		if !currentTags[tag] {
-			return true
-		}
-	}
-
-	currentExitInbounds := 0
-	if inbounds, ok := config["inbounds"].([]interface{}); ok {
-		for _, ib := range inbounds {
-			ibMap, ok := ib.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			tag, _ := ibMap["tag"].(string)
-			if len(tag) > 11 && tag[:11] == "socks-exit-" {
-				currentExitInbounds++
-			}
-		}
-	}
-	if currentExitInbounds != len(channels) {
-		return true
-	}
-
-	return false
-}
-
-func buildPerExitSocksInbounds(channels []PerExitChannel, meta *Metadata) []map[string]interface{} {
-	var result []map[string]interface{}
-	for _, ch := range channels {
-		port, ok := meta.ExitSocksPorts[ch.ExitName]
-		if !ok {
-			continue
-		}
-		result = append(result, map[string]interface{}{
-			"type":        "socks",
-			"tag":         "socks-exit-" + ch.ExitName,
-			"listen":      "127.0.0.1",
-			"listen_port": port,
-		})
-	}
-	return result
-}
-
-func rebuildEntryConfig(currentData []byte, meta *Metadata, transits []TransitInfo, exits []ExitInfo, channels []PerExitChannel) ([]byte, error) {
-	var config map[string]interface{}
-	if err := json.Unmarshal(currentData, &config); err != nil {
-		return nil, err
-	}
-
-	var mainInbounds []interface{}
-	if existingIBs, ok := config["inbounds"].([]interface{}); ok {
-		for _, ib := range existingIBs {
-			ibMap, ok := ib.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			tag, _ := ibMap["tag"].(string)
-			if len(tag) > 11 && tag[:11] == "socks-exit-" {
-				continue
-			}
-			mainInbounds = append(mainInbounds, ib)
-		}
-	}
-	for _, socksIB := range buildPerExitSocksInbounds(channels, meta) {
-		mainInbounds = append(mainInbounds, socksIB)
-	}
-	config["inbounds"] = mainInbounds
-
-	outbounds := BuildEntryOutbounds(transits, exits)
-	outbounds = outbounds[:len(outbounds)-1] // remove trailing direct
-	for _, ch := range channels {
-		outbounds = append(outbounds, map[string]interface{}{
-			"type":        "socks",
-			"tag":         "via-transit-exit-" + ch.ExitName,
-			"server":      ch.TransitAddress,
-			"server_port": ch.Port,
-			"username":    ch.Username,
-			"password":    ch.Password,
-		})
-	}
-	outbounds = append(outbounds, map[string]interface{}{"type": "direct", "tag": "direct"})
-	config["outbounds"] = outbounds
-
-	socks5Rule := extractSocks5Rules(config)
-	route := BuildEntryRoute(exits, 0, nil)
-	rules := route["rules"].([]interface{})
-
-	var perExitRules []interface{}
-	for _, ch := range channels {
-		perExitRules = append(perExitRules, map[string]interface{}{
-			"inbound":  []string{"socks-exit-" + ch.ExitName},
-			"action":   "route",
-			"outbound": "via-transit-exit-" + ch.ExitName,
-		})
-	}
-	if len(perExitRules) > 0 {
-		newRules := make([]interface{}, 0, len(rules)+len(perExitRules))
-		newRules = append(newRules, rules[:2]...)
-		newRules = append(newRules, perExitRules...)
-		newRules = append(newRules, rules[2:]...)
-		route["rules"] = newRules
-	}
-	if socks5Rule != nil {
-		r := route["rules"].([]interface{})
-		route["rules"] = append(r, socks5Rule)
-	}
-	config["route"] = route
-
-	return json.MarshalIndent(config, "", "  ")
-}
-
 // =============================================================================
-// Transit reconcile
+// Topology extraction helpers
 // =============================================================================
-
-func ReconcileTransitConfig(meta *Metadata, downstreams []TopologyTree) error {
-	var exits []ExitInfo
-	for _, ds := range downstreams {
-		if !ds.Self.Alive || ds.Self.Role != RoleExit {
-			continue
-		}
-		ti := pickBestInbound(ds.Self)
-		if ti != nil {
-			exits = append(exits, ExitInfo{TransitInfo: *ti})
-		}
-	}
-	sort.Slice(exits, func(i, j int) bool { return exits[i].Name < exits[j].Name })
-
-	portsChanged := assignTransitExitPorts(meta, exits)
-
-	ConfigMu.Lock()
-	defer ConfigMu.Unlock()
-
-	data, err := os.ReadFile(ConfigPath())
-	if err != nil {
-		return err
-	}
-
-	if !transitConfigNeedsUpdate(data, exits, meta) && !portsChanged {
-		return nil
-	}
-
-	log.Printf("[reconcile] transit update: %d exits", len(exits))
-
-	newData, err := rebuildTransitConfig(data, meta, exits)
-	if err != nil {
-		return err
-	}
-
-	if portsChanged {
-		if err := meta.Save(); err != nil {
-			log.Printf("[reconcile] save metadata error: %v", err)
-		}
-	}
-
-	updateTransitInboundMeta(meta, exits)
-	if err := meta.Save(); err != nil {
-		log.Printf("[reconcile] save metadata error: %v", err)
-	}
-
-	for _, e := range exits {
-		if port, ok := meta.ExitPorts[e.Name]; ok {
-			FirewallAddPort(port, "tcp")
-		}
-	}
-	FirewallReload()
-
-	return validateAndApplyConfig(newData, "[reconcile-transit]")
-}
-
-func assignTransitExitPorts(meta *Metadata, exits []ExitInfo) bool {
-	if meta.ExitPorts == nil {
-		meta.ExitPorts = make(map[string]int)
-	}
-	if meta.ExitAuth == nil {
-		meta.ExitAuth = make(map[string]string)
-	}
-	changed := false
-	for _, e := range exits {
-		if _, exists := meta.ExitPorts[e.Name]; !exists {
-			meta.ExitPorts[e.Name] = AllocatePort(40000, 50000, meta.ExitPorts)
-			changed = true
-			log.Printf("[reconcile] assigned transit port %d for exit %s", meta.ExitPorts[e.Name], e.Name)
-		}
-		if _, exists := meta.ExitAuth[e.Name]; !exists {
-			pw, err := GeneratePassword(16)
-			if err != nil {
-				pw = e.Name
-			}
-			meta.ExitAuth[e.Name] = pw
-			changed = true
-		}
-	}
-	activeExits := map[string]bool{}
-	for _, e := range exits {
-		activeExits[e.Name] = true
-	}
-	for name := range meta.ExitPorts {
-		if !activeExits[name] {
-			delete(meta.ExitPorts, name)
-			delete(meta.ExitAuth, name)
-			changed = true
-		}
-	}
-	return changed
-}
-
-func transitConfigNeedsUpdate(configData []byte, exits []ExitInfo, meta *Metadata) bool {
-	var config map[string]interface{}
-	if err := json.Unmarshal(configData, &config); err != nil {
-		return true
-	}
-	outbounds, ok := config["outbounds"].([]interface{})
-	if !ok {
-		return true
-	}
-	currentExitTags := map[string]bool{}
-	for _, ob := range outbounds {
-		obMap, ok := ob.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		tag, _ := obMap["tag"].(string)
-		if len(tag) > 5 && tag[:5] == "exit-" {
-			currentExitTags[tag] = true
-		}
-	}
-	desiredExitTags := map[string]bool{}
-	for _, e := range exits {
-		desiredExitTags["exit-"+e.Name] = true
-	}
-	if len(currentExitTags) != len(desiredExitTags) {
-		return true
-	}
-	for tag := range desiredExitTags {
-		if !currentExitTags[tag] {
-			return true
-		}
-	}
-	return false
-}
-
-func buildTransitOutbounds(exits []ExitInfo) []interface{} {
-	outbounds := []interface{}{
-		map[string]interface{}{"type": "direct", "tag": "direct"},
-	}
-	for _, e := range exits {
-		outbounds = append(outbounds, BuildProxyOutbound("exit-"+e.Name, &e.TransitInfo))
-	}
-	return outbounds
-}
-
-func buildTransitPerExitInbounds(exits []ExitInfo, meta *Metadata) []map[string]interface{} {
-	var result []map[string]interface{}
-	for _, e := range exits {
-		port, ok := meta.ExitPorts[e.Name]
-		if !ok {
-			continue
-		}
-		pw := meta.ExitAuth[e.Name]
-		result = append(result, map[string]interface{}{
-			"type":        "socks",
-			"tag":         "for-exit-" + e.Name,
-			"listen":      "::",
-			"listen_port": port,
-			"users": []map[string]interface{}{
-				{"username": "sbm", "password": pw},
-			},
-		})
-	}
-	return result
-}
-
-func rebuildTransitConfig(currentData []byte, meta *Metadata, exits []ExitInfo) ([]byte, error) {
-	var config map[string]interface{}
-	if err := json.Unmarshal(currentData, &config); err != nil {
-		return nil, err
-	}
-
-	var mainInbounds []interface{}
-	if existingIBs, ok := config["inbounds"].([]interface{}); ok {
-		for _, ib := range existingIBs {
-			ibMap, ok := ib.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			tag, _ := ibMap["tag"].(string)
-			if len(tag) > 9 && tag[:9] == "for-exit-" {
-				continue
-			}
-			mainInbounds = append(mainInbounds, ib)
-		}
-	}
-	for _, perExitIB := range buildTransitPerExitInbounds(exits, meta) {
-		mainInbounds = append(mainInbounds, perExitIB)
-	}
-	config["inbounds"] = mainInbounds
-	config["outbounds"] = buildTransitOutbounds(exits)
-
-	rules := []interface{}{
-		map[string]interface{}{"action": "sniff"},
-	}
-	for _, e := range exits {
-		rules = append(rules, map[string]interface{}{
-			"inbound":  []string{"for-exit-" + e.Name},
-			"action":   "route",
-			"outbound": "exit-" + e.Name,
-		})
-	}
-	config["route"] = map[string]interface{}{
-		"rules":                rules,
-		"final":                "direct",
-		"auto_detect_interface": true,
-	}
-
-	return json.MarshalIndent(config, "", "  ")
-}
-
-func updateTransitInboundMeta(meta *Metadata, exits []ExitInfo) {
-	var main []InboundMeta
-	for _, inb := range meta.Inbounds {
-		if inb.ForExit == "" {
-			main = append(main, inb)
-		}
-	}
-	for _, e := range exits {
-		port, ok := meta.ExitPorts[e.Name]
-		if !ok {
-			continue
-		}
-		main = append(main, InboundMeta{
-			Tag:       "for-exit-" + e.Name,
-			Protocol:  "socks",
-			Port:      port,
-			Transport: "tcp",
-			ForExit:   e.Name,
-			Username:  "sbm",
-			Password:  meta.ExitAuth[e.Name],
-		})
-	}
-	meta.Inbounds = main
-}
-
-// =============================================================================
-// Shared helpers
-// =============================================================================
-
-func validateAndApplyConfig(newData []byte, logPrefix string) error {
-	tmpFile := ConfigPath() + ".tmp"
-	if err := os.WriteFile(tmpFile, newData, 0600); err != nil {
-		return err
-	}
-	defer os.Remove(tmpFile)
-
-	if err := exec.Command("sing-box", "check", "-c", tmpFile).Run(); err != nil {
-		log.Printf("%s validation failed, not applying: %v", logPrefix, err)
-		return err
-	}
-
-	if err := os.WriteFile(ConfigPath(), newData, 0600); err != nil {
-		return err
-	}
-
-	log.Printf("%s config updated, restarting sing-box", logPrefix)
-	return SystemctlOp("restart", "sing-box")
-}
 
 func topoToTransits(downstreams []TopologyTree) []TransitInfo {
 	var result []TransitInfo
@@ -650,6 +171,7 @@ func topoToTransits(downstreams []TopologyTree) []TransitInfo {
 
 func topoToExits(downstreams []TopologyTree) []ExitInfo {
 	var result []ExitInfo
+	seen := map[string]bool{} // dedup exits across transits
 	for _, transit := range downstreams {
 		if !transit.Self.Alive || transit.Self.Role != RoleTransit {
 			continue
@@ -658,8 +180,13 @@ func topoToExits(downstreams []TopologyTree) []ExitInfo {
 			if !exitDS.Self.Alive || exitDS.Self.Role != RoleExit {
 				continue
 			}
+			if seen[exitDS.Self.NodeID] {
+				continue
+			}
+			seen[exitDS.Self.NodeID] = true
 			ti := pickBestInbound(exitDS.Self)
 			if ti != nil {
+				// ViaTransit: use first available transit (urltest will handle failover)
 				result = append(result, ExitInfo{
 					TransitInfo: *ti,
 					ViaTransit:  transit.Self.Name,
@@ -718,21 +245,196 @@ func pickBestInbound(node NodeInfo) *TransitInfo {
 	}
 }
 
-func configNeedsUpdate(configData []byte, transits []TransitInfo, exits []ExitInfo) bool {
+// =============================================================================
+// Per-exit SOCKS5 port management (Entry localhost, for application routing)
+// =============================================================================
+
+func assignExitSocksPorts(meta *Metadata, exits []ExitInfo) bool {
+	if meta.ExitSocksPorts == nil {
+		meta.ExitSocksPorts = make(map[string]int)
+	}
+	changed := false
+	for _, e := range exits {
+		if _, exists := meta.ExitSocksPorts[e.Name]; !exists {
+			port := AllocatePort(10800, 10900, meta.ExitSocksPorts)
+			meta.ExitSocksPorts[e.Name] = port
+			changed = true
+			log.Printf("[reconcile] assigned socks5 port %d for exit %s", port, e.Name)
+		}
+	}
+	activeExits := map[string]bool{}
+	for _, e := range exits {
+		activeExits[e.Name] = true
+	}
+	for name := range meta.ExitSocksPorts {
+		if !activeExits[name] {
+			delete(meta.ExitSocksPorts, name)
+			changed = true
+		}
+	}
+	return changed
+}
+
+// =============================================================================
+// Config diff detection
+// =============================================================================
+
+func entryConfigNeedsUpdate(configData []byte, transits []TransitInfo, exits []ExitInfo, meta *Metadata) bool {
 	var config map[string]interface{}
 	if err := json.Unmarshal(configData, &config); err != nil {
 		return true
 	}
-	currentOutbounds, ok := config["outbounds"]
+
+	outbounds, ok := config["outbounds"].([]interface{})
 	if !ok {
 		return true
 	}
-	currentJSON, err := json.Marshal(currentOutbounds)
-	if err != nil {
+	currentTags := map[string]bool{}
+	for _, ob := range outbounds {
+		obMap, ok := ob.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if tag, ok := obMap["tag"].(string); ok {
+			currentTags[tag] = true
+		}
+	}
+
+	desiredTags := map[string]bool{"gia-auto": true, "direct": true}
+	for _, t := range transits {
+		desiredTags["transit-"+t.Name] = true
+	}
+	for _, e := range exits {
+		desiredTags["exit-"+e.Name] = true
+	}
+	if len(exits) > 0 {
+		desiredTags["residential"] = true
+	}
+
+	if len(currentTags) != len(desiredTags) {
 		return true
 	}
-	desiredJSON, _ := json.Marshal(BuildEntryOutbounds(transits, exits))
-	return sha256.Sum256(currentJSON) != sha256.Sum256(desiredJSON)
+	for tag := range desiredTags {
+		if !currentTags[tag] {
+			return true
+		}
+	}
+
+	// Check per-exit inbound count
+	currentExitInbounds := 0
+	if inbounds, ok := config["inbounds"].([]interface{}); ok {
+		for _, ib := range inbounds {
+			ibMap, ok := ib.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			tag, _ := ibMap["tag"].(string)
+			if len(tag) > 11 && tag[:11] == "socks-exit-" {
+				currentExitInbounds++
+			}
+		}
+	}
+	if currentExitInbounds != len(exits) {
+		return true
+	}
+
+	return false
+}
+
+// =============================================================================
+// Config rebuild — preserves inbounds, regenerates outbounds + route
+// =============================================================================
+
+func rebuildEntryConfig(currentData []byte, meta *Metadata, transits []TransitInfo, exits []ExitInfo) ([]byte, error) {
+	var config map[string]interface{}
+	if err := json.Unmarshal(currentData, &config); err != nil {
+		return nil, err
+	}
+
+	// --- Inbounds: preserve main, replace per-exit SOCKS5 ---
+	var mainInbounds []interface{}
+	if existingIBs, ok := config["inbounds"].([]interface{}); ok {
+		for _, ib := range existingIBs {
+			ibMap, ok := ib.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			tag, _ := ibMap["tag"].(string)
+			if len(tag) > 11 && tag[:11] == "socks-exit-" {
+				continue
+			}
+			mainInbounds = append(mainInbounds, ib)
+		}
+	}
+	for _, e := range exits {
+		port, ok := meta.ExitSocksPorts[e.Name]
+		if !ok {
+			continue
+		}
+		mainInbounds = append(mainInbounds, map[string]interface{}{
+			"type":        "socks",
+			"tag":         "socks-exit-" + e.Name,
+			"listen":      "127.0.0.1",
+			"listen_port": port,
+		})
+	}
+	config["inbounds"] = mainInbounds
+
+	// --- Outbounds: transit + exit (detour) + urltest groups ---
+	config["outbounds"] = BuildEntryOutbounds(transits, exits)
+
+	// --- Route: per-exit inbound rules + domain rules + CN/AI/default ---
+	socks5Rule := extractSocks5Rules(config)
+	route := BuildEntryRoute(exits, 0, nil)
+	rules := route["rules"].([]interface{})
+
+	// Insert per-exit inbound rules after DNS + private IP (index 2)
+	var perExitRules []interface{}
+	for _, e := range exits {
+		perExitRules = append(perExitRules, map[string]interface{}{
+			"inbound":  []string{"socks-exit-" + e.Name},
+			"action":   "route",
+			"outbound": "exit-" + e.Name,
+		})
+	}
+	if len(perExitRules) > 0 {
+		newRules := make([]interface{}, 0, len(rules)+len(perExitRules))
+		newRules = append(newRules, rules[:2]...)
+		newRules = append(newRules, perExitRules...)
+		newRules = append(newRules, rules[2:]...)
+		route["rules"] = newRules
+	}
+	if socks5Rule != nil {
+		r := route["rules"].([]interface{})
+		route["rules"] = append(r, socks5Rule)
+	}
+	config["route"] = route
+
+	return json.MarshalIndent(config, "", "  ")
+}
+
+// =============================================================================
+// Shared helpers
+// =============================================================================
+
+func validateAndApplyConfig(newData []byte, logPrefix string) error {
+	tmpFile := ConfigPath() + ".tmp"
+	if err := os.WriteFile(tmpFile, newData, 0600); err != nil {
+		return err
+	}
+	defer os.Remove(tmpFile)
+
+	if err := exec.Command("sing-box", "check", "-c", tmpFile).Run(); err != nil {
+		log.Printf("%s validation failed, not applying: %v", logPrefix, err)
+		return err
+	}
+
+	if err := os.WriteFile(ConfigPath(), newData, 0600); err != nil {
+		return err
+	}
+
+	log.Printf("%s config updated, restarting sing-box", logPrefix)
+	return SystemctlOp("restart", "sing-box")
 }
 
 func extractSocks5Rules(config map[string]interface{}) interface{} {
