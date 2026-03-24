@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"crypto/tls"
+	"database/sql"
 	"flag"
 	"fmt"
 	"log"
@@ -36,11 +37,21 @@ func RunServe(args []string) error {
 	// Topology store for aggregating downstream reports
 	topoStore := internal.NewTopoStore()
 
+	// Open users DB once (entry only, used by handlers and traffic collector)
+	var usersDB *sql.DB
+	if meta.Role == internal.RoleEntry {
+		var dbErr error
+		usersDB, dbErr = internal.OpenUsersDB()
+		if dbErr != nil {
+			log.Printf("[users] failed to open users DB: %v", dbErr)
+		}
+	}
+
 	mux := http.NewServeMux()
 
 	// Subscription endpoints
 	mux.HandleFunc("/sub/hz-office", handleSub) // legacy
-	mux.HandleFunc("/sub/", handleUserSub)      // per-user: /sub/<username>
+	mux.HandleFunc("/sub/", makeUserSubHandler(usersDB))
 
 	// Topology API endpoints
 	mux.HandleFunc("/node-info", internal.BearerAuth(meta.APIToken, internal.HandleNodeInfo(meta)))
@@ -48,9 +59,9 @@ func RunServe(args []string) error {
 	mux.HandleFunc("/report", internal.BearerAuth(meta.APIToken, internal.HandleReport(topoStore)))
 
 	// Dashboard (entry only)
-	if meta.Role == internal.RoleEntry {
+	if meta.Role == internal.RoleEntry && usersDB != nil {
 		mux.HandleFunc("/dashboard", internal.BearerAuth(meta.APIToken, handleDashboard))
-		mux.HandleFunc("/api/users", internal.BearerAuth(meta.APIToken, handleAPIUsers))
+		mux.HandleFunc("/api/users", internal.BearerAuth(meta.APIToken, makeAPIUsersHandler(usersDB)))
 	}
 
 	// Start topology reporter (reports to upstreams)
@@ -62,17 +73,15 @@ func RunServe(args []string) error {
 	}
 
 	// Traffic collector + quota enforcement (entry only)
-	if meta.Role == internal.RoleEntry {
-		usersDB, err := internal.OpenUsersDB()
-		if err != nil {
-			log.Printf("[traffic] failed to open users DB: %v", err)
-		} else {
-			internal.StartTrafficCollector(usersDB, "", 30*time.Second, func(disabled []string) {
-				// Users disabled by quota — need to regenerate config to remove them
-				log.Printf("[traffic] regenerating config to remove disabled users: %v", disabled)
-				// TODO: trigger config regeneration
-			})
-		}
+	if meta.Role == internal.RoleEntry && usersDB != nil {
+		internal.StartTrafficCollector(usersDB, "", 30*time.Second, func(disabled []string) {
+			log.Printf("[traffic] quota exceeded, disabling users %v → restarting sing-box", disabled)
+			// Restart sing-box so it drops connections from disabled users
+			// (reconcile will regenerate config with only enabled users on next cycle)
+			internal.ConfigMu.Lock()
+			defer internal.ConfigMu.Unlock()
+			internal.SystemctlOp("restart", "sing-box")
+		})
 	}
 
 	// BWG bandwidth balancing (entry only)
@@ -143,63 +152,55 @@ func findCertFiles(domain string) (certFile, keyFile string) {
 	return internal.CertPath(domain), internal.CertKeyPath(domain)
 }
 
-// handleUserSub handles per-user subscription: GET /sub/<username>
-func handleUserSub(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
+// makeUserSubHandler returns a handler for per-user subscription: GET /sub/<username>
+func makeUserSubHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
 
-	// Extract username from path: /sub/<username>
-	path := strings.TrimPrefix(r.URL.Path, "/sub/")
-	username := strings.TrimSuffix(path, "/")
-	if username == "" || username == "hz-office" {
-		handleSub(w, r) // legacy fallback
-		return
-	}
+		path := strings.TrimPrefix(r.URL.Path, "/sub/")
+		username := strings.TrimSuffix(path, "/")
+		if username == "" || username == "hz-office" {
+			handleSub(w, r)
+			return
+		}
 
-	db, err := internal.OpenUsersDB()
-	if err != nil {
-		log.Printf("open users db error: %v", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-	defer db.Close()
+		if db == nil {
+			http.Error(w, "user management not available", http.StatusServiceUnavailable)
+			return
+		}
 
-	sub, err := internal.GenerateSubscriptionForUser(db, username)
-	if err != nil {
-		log.Printf("generate subscription for %s: %v", username, err)
+		sub, err := internal.GenerateSubscriptionForUser(db, username)
+		if err != nil {
+			log.Printf("generate subscription for %s: %v", username, err)
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(http.StatusForbidden)
+			w.Write([]byte(err.Error()))
+			return
+		}
+
+		data := []byte(sub)
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(http.StatusForbidden)
-		w.Write([]byte(err.Error()))
-		return
-	}
-
-	data := []byte(sub)
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
-	if r.Method == http.MethodGet {
-		w.Write(data)
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+		if r.Method == http.MethodGet {
+			w.Write(data)
+		}
 	}
 }
 
-// handleAPIUsers returns JSON list of users with traffic for dashboard.
-func handleAPIUsers(w http.ResponseWriter, r *http.Request) {
-	db, err := internal.OpenUsersDB()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+// makeAPIUsersHandler returns a handler for JSON user list.
+func makeAPIUsersHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		users, err := internal.ListUsers(db)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		internal.PrintJSONTo(w, users)
 	}
-	defer db.Close()
-
-	users, err := internal.ListUsers(db)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	internal.PrintJSONTo(w, users)
 }
 
 // handleDashboard serves a simple HTML dashboard.

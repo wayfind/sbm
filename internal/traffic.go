@@ -7,25 +7,25 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 )
 
 // ClashAPIAddr is the Clash API listen address for traffic monitoring.
 const ClashAPIAddr = "127.0.0.1:9090"
 
-// ClashConnections is the response from GET /connections.
 type ClashConnections struct {
-	DownloadTotal int64            `json:"downloadTotal"`
-	UploadTotal   int64            `json:"uploadTotal"`
+	DownloadTotal int64             `json:"downloadTotal"`
+	UploadTotal   int64             `json:"uploadTotal"`
 	Connections   []ClashConnection `json:"connections"`
 }
 
 type ClashConnection struct {
-	ID       string         `json:"id"`
-	Upload   int64          `json:"upload"`
-	Download int64          `json:"download"`
-	Metadata ClashMetadata  `json:"metadata"`
-	Chains   []string       `json:"chains"`
+	ID       string        `json:"id"`
+	Upload   int64         `json:"upload"`
+	Download int64         `json:"download"`
+	Metadata ClashMetadata `json:"metadata"`
+	Chains   []string      `json:"chains"`
 }
 
 type ClashMetadata struct {
@@ -40,8 +40,13 @@ type ClashMetadata struct {
 	InboundUser string `json:"inboundUser"`
 }
 
-// lastSeen tracks cumulative bytes per connection ID to compute deltas.
-var lastSeen = map[string]int64{}
+// connTracker tracks cumulative bytes per connection ID to compute deltas.
+type connTracker struct {
+	mu       sync.Mutex
+	lastSeen map[string]int64
+}
+
+var tracker = connTracker{lastSeen: make(map[string]int64)}
 
 // FetchAndRecordTraffic queries Clash API /connections, aggregates per-user traffic,
 // records deltas to SQLite, and checks quotas.
@@ -51,7 +56,15 @@ func FetchAndRecordTraffic(db *sql.DB, secret string) (disabled []string, err er
 		return nil, err
 	}
 
-	// Aggregate per user
+	tracker.mu.Lock()
+
+	// If no connections at all, sing-box may have restarted — clear state
+	if len(conns.Connections) == 0 {
+		tracker.lastSeen = make(map[string]int64)
+		tracker.mu.Unlock()
+		return CheckQuotas(db)
+	}
+
 	userUp := map[string]int64{}
 	userDown := map[string]int64{}
 	currentIDs := map[string]bool{}
@@ -64,17 +77,13 @@ func FetchAndRecordTraffic(db *sql.DB, secret string) (disabled []string, err er
 		currentIDs[c.ID] = true
 
 		total := c.Upload + c.Download
-		prev, exists := lastSeen[c.ID]
-		if !exists {
-			prev = 0
-		}
+		prev := tracker.lastSeen[c.ID]
 		delta := total - prev
 		if delta <= 0 {
 			continue
 		}
-		lastSeen[c.ID] = total
+		tracker.lastSeen[c.ID] = total
 
-		// Split delta proportionally between up/down
 		if c.Upload+c.Download > 0 {
 			upRatio := float64(c.Upload) / float64(c.Upload+c.Download)
 			userUp[user] += int64(float64(delta) * upRatio)
@@ -82,12 +91,14 @@ func FetchAndRecordTraffic(db *sql.DB, secret string) (disabled []string, err er
 		}
 	}
 
-	// Clean up closed connections from lastSeen
-	for id := range lastSeen {
+	// Clean up closed connections
+	for id := range tracker.lastSeen {
 		if !currentIDs[id] {
-			delete(lastSeen, id)
+			delete(tracker.lastSeen, id)
 		}
 	}
+
+	tracker.mu.Unlock()
 
 	// Record to SQLite
 	for user, up := range userUp {
@@ -99,7 +110,6 @@ func FetchAndRecordTraffic(db *sql.DB, secret string) (disabled []string, err er
 		}
 	}
 
-	// Check quotas
 	return CheckQuotas(db)
 }
 
@@ -120,12 +130,16 @@ func fetchConnections(secret string) (*ClashConnections, error) {
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20)) // 10MB limit
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
 	if err != nil {
 		return nil, err
 	}
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("clash api status %d: %s", resp.StatusCode, string(body[:100]))
+		preview := string(body)
+		if len(preview) > 100 {
+			preview = preview[:100]
+		}
+		return nil, fmt.Errorf("clash api status %d: %s", resp.StatusCode, preview)
 	}
 
 	var conns ClashConnections
@@ -138,7 +152,7 @@ func fetchConnections(secret string) (*ClashConnections, error) {
 // StartTrafficCollector runs periodic traffic collection from Clash API.
 func StartTrafficCollector(db *sql.DB, secret string, interval time.Duration, onDisable func([]string)) {
 	go func() {
-		time.Sleep(10 * time.Second) // wait for sing-box to start
+		time.Sleep(10 * time.Second)
 
 		for {
 			disabled, err := FetchAndRecordTraffic(db, secret)
