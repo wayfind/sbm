@@ -3,6 +3,7 @@ package cmd
 import (
 	"crypto/tls"
 	"database/sql"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -58,10 +59,12 @@ func RunServe(args []string) error {
 	mux.HandleFunc("/topology", internal.BearerAuth(meta.APIToken, internal.HandleTopology(meta, topoStore)))
 	mux.HandleFunc("/report", internal.BearerAuth(meta.APIToken, internal.HandleReport(topoStore)))
 
-	// Dashboard (entry only)
+	// Dashboard + API (entry only)
 	if meta.Role == internal.RoleEntry && usersDB != nil {
 		mux.HandleFunc("/dashboard", internal.BearerAuth(meta.APIToken, handleDashboard))
-		mux.HandleFunc("/api/users", internal.BearerAuth(meta.APIToken, makeAPIUsersHandler(usersDB)))
+		mux.HandleFunc("/api/users/", internal.BearerAuth(meta.APIToken, makeAPIUsersRouter(usersDB, meta)))
+		mux.HandleFunc("/api/users", internal.BearerAuth(meta.APIToken, makeAPIUsersRouter(usersDB, meta)))
+		mux.HandleFunc("/api/config/rules", internal.BearerAuth(meta.APIToken, handleConfigRules))
 	}
 
 	// Initialize CF topology client (if configured)
@@ -197,17 +200,138 @@ func makeUserSubHandler(db *sql.DB) http.HandlerFunc {
 	}
 }
 
-// makeAPIUsersHandler returns a handler for JSON user list.
-func makeAPIUsersHandler(db *sql.DB) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		users, err := internal.ListUsers(db)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		internal.PrintJSONTo(w, users)
+// makeAPIUsersRouter returns a handler that routes /api/users requests by method and subpath.
+func makeAPIUsersRouter(db *sql.DB, meta *internal.Metadata) http.HandlerFunc {
+	subPort := meta.SubPort
+	if subPort == 0 {
+		subPort = 20033
 	}
+	subBase := fmt.Sprintf("https://%s:%d/sub/", meta.Domain, subPort)
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		// Extract username from path: /api/users/<name>[/action]
+		subpath := strings.TrimPrefix(r.URL.Path, "/api/users")
+		subpath = strings.TrimPrefix(subpath, "/")
+		parts := strings.SplitN(subpath, "/", 2)
+		name := parts[0]
+		action := ""
+		if len(parts) > 1 {
+			action = parts[1]
+		}
+
+		switch {
+		// GET /api/users — list all users
+		case r.Method == "GET" && name == "":
+			users, err := internal.ListUsers(db)
+			if err != nil {
+				jsonError(w, err.Error(), 500)
+				return
+			}
+			// Inject sub_url for each user
+			type userResponse struct {
+				internal.UserWithTraffic
+				SubURL string `json:"sub_url"`
+			}
+			resp := make([]userResponse, len(users))
+			for i, u := range users {
+				resp[i] = userResponse{u, subBase + u.Name}
+			}
+			internal.PrintJSONTo(w, resp)
+
+		// POST /api/users — add user
+		case r.Method == "POST" && name == "":
+			var req struct {
+				Name    string  `json:"name"`
+				QuotaGB float64 `json:"quota_gb"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				jsonError(w, "invalid json", 400)
+				return
+			}
+			if req.Name == "" {
+				jsonError(w, "name required", 400)
+				return
+			}
+			user, err := internal.AddUser(db, req.Name, req.QuotaGB)
+			if err != nil {
+				jsonError(w, err.Error(), 400)
+				return
+			}
+			w.WriteHeader(201)
+			internal.PrintJSONTo(w, user)
+
+		// DELETE /api/users/<name> — delete user
+		case r.Method == "DELETE" && name != "":
+			if err := internal.DelUser(db, name); err != nil {
+				jsonError(w, err.Error(), 400)
+				return
+			}
+			internal.PrintJSONTo(w, map[string]string{"status": "ok"})
+
+		// PUT /api/users/<name> — update user (quota_gb, enabled)
+		case r.Method == "PUT" && name != "" && action == "":
+			var req struct {
+				QuotaGB *float64 `json:"quota_gb,omitempty"`
+				Enabled *bool    `json:"enabled,omitempty"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				jsonError(w, "invalid json", 400)
+				return
+			}
+			if req.QuotaGB != nil {
+				if err := internal.SetUserQuota(db, name, *req.QuotaGB); err != nil {
+					jsonError(w, err.Error(), 400)
+					return
+				}
+			}
+			if req.Enabled != nil {
+				if err := internal.SetUserEnabled(db, name, *req.Enabled); err != nil {
+					jsonError(w, err.Error(), 400)
+					return
+				}
+			}
+			user, err := internal.GetUser(db, name)
+			if err != nil {
+				jsonError(w, err.Error(), 404)
+				return
+			}
+			internal.PrintJSONTo(w, user)
+
+		// POST /api/users/<name>/reset — reset traffic
+		case r.Method == "POST" && name != "" && action == "reset":
+			if err := internal.ResetUserTraffic(db, name); err != nil {
+				jsonError(w, err.Error(), 400)
+				return
+			}
+			// Also re-enable user after reset
+			internal.SetUserEnabled(db, name, true)
+			user, err := internal.GetUser(db, name)
+			if err != nil {
+				jsonError(w, err.Error(), 404)
+				return
+			}
+			internal.PrintJSONTo(w, user)
+
+		default:
+			jsonError(w, "not found", 404)
+		}
+	}
+}
+
+func jsonError(w http.ResponseWriter, msg string, code int) {
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+// handleConfigRules returns current routing rules (read-only).
+func handleConfigRules(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	internal.PrintJSONTo(w, map[string]interface{}{
+		"ai_domains": internal.AIResidentialDomains,
+		"rule_sets":  internal.BuildRuleSetDefs(),
+	})
 }
 
 // handleDashboard serves a simple HTML dashboard.
