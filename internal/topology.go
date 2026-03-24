@@ -62,7 +62,7 @@ func (s *TopoStore) Update(tree TopologyTree) {
 }
 
 // StaleThreshold is how long since last report before a node is considered dead.
-const StaleThreshold = 20 * time.Minute // ~3 report intervals at 5m
+const StaleThreshold = 90 * time.Second // debug: ~3 report intervals at 30s
 
 func (s *TopoStore) GetDownstreams() []TopologyTree {
 	s.mu.RLock()
@@ -84,7 +84,7 @@ func (s *TopoStore) Prune() {
 	defer s.mu.Unlock()
 	now := time.Now()
 	for id, t := range s.downstreams {
-		if now.Sub(t.Self.ReportedAt) > time.Hour {
+		if now.Sub(t.Self.ReportedAt) > 3*time.Minute { // debug: prune after 3min
 			delete(s.downstreams, id)
 		}
 	}

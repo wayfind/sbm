@@ -328,11 +328,8 @@ func rebuildEntryConfig(currentData []byte, meta *Metadata, transits []TransitIn
 
 func ReconcileTransitConfig(meta *Metadata, store *TopoStore) error {
 	downstreams := store.GetDownstreams()
-	if len(downstreams) == 0 {
-		return nil
-	}
 
-	// Extract alive exits from direct downstreams
+	// Extract alive exits (may be empty if all exits are down or pruned)
 	var exits []ExitInfo
 	for _, ds := range downstreams {
 		if !ds.Self.Alive || ds.Self.Role != RoleExit {
