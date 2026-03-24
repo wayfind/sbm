@@ -1,70 +1,82 @@
 package internal
 
 import (
+	"database/sql"
 	"encoding/base64"
 	"fmt"
 	"net/url"
 	"strings"
 )
 
-func GenerateSubscription() (string, error) {
-	cfg, err := LoadSingBoxConfig()
-	if err != nil {
-		return "", err
-	}
+// GenerateUserSubscription generates a subscription for a specific user.
+// If user is nil, generates legacy single-user subscription.
+func GenerateUserSubscription(user *UserWithTraffic) (string, error) {
 	meta, err := LoadMetadata()
 	if err != nil {
 		return "", err
 	}
 
-	// Build lookup from metadata inbounds for protocol-specific fields
-	inboundMeta := make(map[string]*InboundMeta)
-	for i := range meta.Inbounds {
-		inboundMeta[meta.Inbounds[i].Tag] = &meta.Inbounds[i]
+	addr := meta.Domain
+	if addr == "" {
+		return "", fmt.Errorf("no domain configured")
 	}
 
 	var uris []string
-	for _, inb := range cfg.Inbounds {
-		im := inboundMeta[inb.Tag]
-		switch inb.Type {
-		case "vless":
-			if len(inb.Users) == 0 {
-				continue
-			}
-			user := inb.Users[0]
-			// Get reality public key from metadata or fallback
-			pbk := ""
-			sid := ""
-			if im != nil {
-				pbk = im.PublicKey
-				sid = im.ShortID
-			}
+
+	// Find VLESS inbound port from metadata
+	for _, inb := range meta.Inbounds {
+		if inb.Protocol == "vless" && inb.ForExit == "" {
+			pbk := inb.PublicKey
+			sid := inb.ShortID
 			params := url.Values{
-				"flow": {user.Flow}, "type": {"tcp"}, "security": {"reality"},
+				"flow": {"xtls-rprx-vision"}, "type": {"tcp"}, "security": {"reality"},
 				"pbk": {pbk}, "sid": {sid},
 				"fp": {"chrome"}, "sni": {"www.walmart.com"},
 			}
-			uris = append(uris, fmt.Sprintf("vless://%s@%s:%d?%s#vless-reality",
-				user.UUID, meta.Domain, inb.ListenPort, params.Encode()))
+			uuid := inb.UUID
+			name := "vless-reality"
+			if user != nil {
+				uuid = user.UUID
+				name = user.Name + "-vless"
+			}
+			uris = append(uris, fmt.Sprintf("vless://%s@%s:%d?%s#%s",
+				uuid, addr, inb.Port, params.Encode(), name))
+		}
 
-		case "hysteria2":
-			if len(inb.Users) == 0 {
-				continue
-			}
-			user := inb.Users[0]
-			obfsPw := ""
-			if inb.Obfs != nil {
-				obfsPw = inb.Obfs.Password
-			}
+		if inb.Protocol == "hysteria2" && inb.ForExit == "" {
+			obfsPw := inb.ObfsPass
 			params := url.Values{
-				"sni": {meta.Domain}, "obfs": {"salamander"},
+				"sni": {addr}, "obfs": {"salamander"},
 				"obfs-password": {obfsPw}, "alpn": {"h3"},
 			}
-			uris = append(uris, fmt.Sprintf("hysteria2://%s@%s:%d?%s#hysteria2",
-				url.QueryEscape(user.Password), meta.Domain, inb.ListenPort, params.Encode()))
+			password := inb.Password
+			name := "hysteria2"
+			if user != nil {
+				password = user.Password
+				name = user.Name + "-hy2"
+			}
+			uris = append(uris, fmt.Sprintf("hysteria2://%s@%s:%d?%s#%s",
+				url.QueryEscape(password), addr, inb.Port, params.Encode(), name))
 		}
 	}
 
 	content := strings.Join(uris, "\n")
 	return base64.StdEncoding.EncodeToString([]byte(content)), nil
+}
+
+// GenerateSubscription generates legacy subscription (first user or install params).
+func GenerateSubscription() (string, error) {
+	return GenerateUserSubscription(nil)
+}
+
+// GenerateSubscriptionForUser generates subscription for a named user from SQLite.
+func GenerateSubscriptionForUser(db *sql.DB, username string) (string, error) {
+	user, err := GetUser(db, username)
+	if err != nil {
+		return "", err
+	}
+	if !user.Enabled {
+		return "", fmt.Errorf("user %s is disabled (quota exceeded?)", username)
+	}
+	return GenerateUserSubscription(user)
 }

@@ -35,6 +35,9 @@ type EntryParams struct {
 
 	// Upstream exit nodes (residential)
 	Exits []ExitInfo
+
+	// Users (for multi-user inbounds, from SQLite)
+	Users []User
 }
 
 // TransitInfo describes a proxy node's connection parameters.
@@ -73,13 +76,28 @@ func GenerateEntryConfig(p *EntryParams) (map[string]interface{}, error) {
 	// --- Inbounds ---
 	inbounds := []interface{}{}
 
+	// Build users arrays for multi-user inbounds
+	vlessUsers := []map[string]interface{}{}
+	hy2Users := []map[string]interface{}{}
+	userNames := []string{}
+
+	if len(p.Users) > 0 {
+		for _, u := range p.Users {
+			vlessUsers = append(vlessUsers, map[string]interface{}{"name": u.Name, "uuid": u.UUID, "flow": "xtls-rprx-vision"})
+			hy2Users = append(hy2Users, map[string]interface{}{"name": u.Name, "password": u.Password})
+			userNames = append(userNames, u.Name)
+		}
+	} else {
+		// Fallback: single user from install params
+		vlessUsers = append(vlessUsers, map[string]interface{}{"uuid": p.UUID, "flow": "xtls-rprx-vision"})
+		hy2Users = append(hy2Users, map[string]interface{}{"password": p.Hy2Pass})
+	}
+
 	// VLESS Reality inbound (always, no domain needed)
 	inbounds = append(inbounds, map[string]interface{}{
 		"type": "vless", "tag": "vless-in",
 		"listen": "::", "listen_port": p.VlessPort,
-		"users": []map[string]interface{}{
-			{"uuid": p.UUID, "flow": "xtls-rprx-vision"},
-		},
+		"users": vlessUsers,
 		"tls": map[string]interface{}{
 			"enabled":     true,
 			"server_name": "www.walmart.com",
@@ -114,7 +132,7 @@ func GenerateEntryConfig(p *EntryParams) (map[string]interface{}, error) {
 		inbounds = append(inbounds, map[string]interface{}{
 			"type": "hysteria2", "tag": "hy2-in",
 			"listen": "::", "listen_port": p.Hy2Port,
-			"users":                   []map[string]interface{}{{"password": p.Hy2Pass}},
+			"users":                   hy2Users,
 			"ignore_client_bandwidth": ignoreBW,
 			"obfs":                    map[string]interface{}{"type": "salamander", "password": p.ObfsPass},
 			"tls":                     hy2TLS,
@@ -153,6 +171,9 @@ func GenerateEntryConfig(p *EntryParams) (map[string]interface{}, error) {
 		"cache_file": map[string]interface{}{
 			"enabled":    true,
 			"store_rdrc": true,
+		},
+		"clash_api": map[string]interface{}{
+			"external_controller": "127.0.0.1:9090",
 		},
 	}
 

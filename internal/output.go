@@ -3,6 +3,7 @@ package internal
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 )
 
@@ -23,4 +24,11 @@ func PrintJSON(v interface{}) {
 // PrintErrorJSON outputs a JSON error object and exits with code 1.
 func PrintErrorJSON(msg string) {
 	PrintJSON(map[string]string{"error": msg})
+}
+
+// PrintJSONTo writes indented JSON to a writer (for HTTP responses).
+func PrintJSONTo(w io.Writer, v interface{}) {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	enc.Encode(v)
 }

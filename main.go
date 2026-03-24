@@ -52,6 +52,8 @@ func main() {
 		err = cmd.RunBWG(os.Args[2:])
 	case "client":
 		err = cmd.RunClient(os.Args[2:])
+	case "user":
+		err = cmd.RunUser(os.Args[2:])
 	case "metadata":
 		err = cmd.RunMetadata()
 	case "version", "-v", "--version":
@@ -160,6 +162,7 @@ func usage() {
   sbm bwg status                               查看 GIA 带宽
   sbm bwg rotate                               手动流量均衡
   sbm client gen --upstream <URL> --platform <平台>  生成客户端配置
+  sbm user add/del/list/set-quota/enable/disable    用户管理
   sbm metadata                                 查看元数据
   sbm serve                                    启动订阅 HTTPS 服务 (前台)
   sbm version                                  版本信息
