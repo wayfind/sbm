@@ -15,17 +15,20 @@ import (
 var ConfigMu sync.Mutex
 
 // StartReconcileLoop starts periodic reconciliation for entry or transit nodes.
-func StartReconcileLoop(meta *Metadata, store *TopoStore, interval time.Duration) {
+// Uses CF as primary topology source, falls back to local TopoStore.
+func StartReconcileLoop(meta *Metadata, store *TopoStore, cfClient *CFTopoClient, interval time.Duration) {
 	go func() {
-		time.Sleep(10 * time.Second) // wait for initial reports
+		time.Sleep(10 * time.Second)
 
 		for {
+			downstreams := getTopoFromDualView(meta, store, cfClient)
+
 			var err error
 			switch meta.Role {
 			case RoleEntry:
-				err = ReconcileEntryConfig(meta, store)
+				err = ReconcileEntryConfig(meta, downstreams)
 			case RoleTransit:
-				err = ReconcileTransitConfig(meta, store)
+				err = ReconcileTransitConfig(meta, downstreams)
 			}
 			if err != nil {
 				log.Printf("[reconcile] error: %v", err)
@@ -36,12 +39,88 @@ func StartReconcileLoop(meta *Metadata, store *TopoStore, interval time.Duration
 	log.Printf("[reconcile] started, role=%s, interval=%s", meta.Role, interval)
 }
 
+// getTopoFromDualView reads topology from CF (primary) and local store (fallback).
+func getTopoFromDualView(meta *Metadata, store *TopoStore, cfClient *CFTopoClient) []TopologyTree {
+	localDownstreams := store.GetDownstreams()
+
+	if cfClient == nil {
+		return localDownstreams
+	}
+
+	cfNodes, err := cfClient.GetAllNodes()
+	if err != nil {
+		log.Printf("[reconcile] CF unavailable, using local view: %v", err)
+		return localDownstreams
+	}
+
+	cfDownstreams := cfNodesToDownstreams(cfNodes, meta)
+
+	// Consistency check
+	cfIDs := map[string]bool{}
+	for _, d := range cfDownstreams {
+		cfIDs[d.Self.NodeID] = true
+	}
+	localIDs := map[string]bool{}
+	for _, d := range localDownstreams {
+		localIDs[d.Self.NodeID] = true
+	}
+	for id := range cfIDs {
+		if !localIDs[id] {
+			log.Printf("[reconcile] ALERT: node %s in CF but not in chain → data-plane break?", id)
+		}
+	}
+	for id := range localIDs {
+		if !cfIDs[id] {
+			log.Printf("[reconcile] WARN: node %s in chain but not in CF → CF channel issue?", id)
+		}
+	}
+
+	return cfDownstreams
+}
+
+// cfNodesToDownstreams converts flat CF node list into topology trees.
+func cfNodesToDownstreams(nodes []NodeInfo, meta *Metadata) []TopologyTree {
+	transitNodes := []NodeInfo{}
+	exitNodes := []NodeInfo{}
+	for _, n := range nodes {
+		if n.NodeID == meta.NodeID {
+			continue
+		}
+		switch n.Role {
+		case RoleTransit:
+			transitNodes = append(transitNodes, n)
+		case RoleExit:
+			exitNodes = append(exitNodes, n)
+		}
+	}
+
+	switch meta.Role {
+	case RoleEntry:
+		var result []TopologyTree
+		for _, t := range transitNodes {
+			tree := TopologyTree{Self: t}
+			for _, e := range exitNodes {
+				tree.Downstreams = append(tree.Downstreams, TopologyTree{Self: e})
+			}
+			result = append(result, tree)
+		}
+		return result
+	case RoleTransit:
+		var result []TopologyTree
+		for _, e := range exitNodes {
+			result = append(result, TopologyTree{Self: e})
+		}
+		return result
+	default:
+		return nil
+	}
+}
+
 // =============================================================================
 // Entry reconcile
 // =============================================================================
 
-func ReconcileEntryConfig(meta *Metadata, store *TopoStore) error {
-	downstreams := store.GetDownstreams()
+func ReconcileEntryConfig(meta *Metadata, downstreams []TopologyTree) error {
 	if len(downstreams) == 0 {
 		return nil
 	}
@@ -55,7 +134,6 @@ func ReconcileEntryConfig(meta *Metadata, store *TopoStore) error {
 		return nil
 	}
 
-	// Assign/persist socks5 ports for per-exit channels
 	portsChanged := assignExitSocksPorts(meta, perExitChannels)
 
 	ConfigMu.Lock()
@@ -89,15 +167,14 @@ func ReconcileEntryConfig(meta *Metadata, store *TopoStore) error {
 
 // PerExitChannel represents a per-exit channel on a transit node.
 type PerExitChannel struct {
-	ExitName       string // exit node name (e.g. "lisa")
-	TransitName    string // transit that has the per-exit inbound
-	TransitAddress string // transit domain/IP
-	Port           int    // transit's per-exit inbound port
-	Username       string // socks5 auth username
-	Password       string // socks5 auth password
+	ExitName       string
+	TransitName    string
+	TransitAddress string
+	Port           int
+	Username       string
+	Password       string
 }
 
-// topoToPerExitChannels extracts per-exit channel info from transit inbounds.
 func topoToPerExitChannels(downstreams []TopologyTree) []PerExitChannel {
 	var result []PerExitChannel
 	for _, transit := range downstreams {
@@ -125,8 +202,6 @@ func topoToPerExitChannels(downstreams []TopologyTree) []PerExitChannel {
 	return result
 }
 
-// assignExitSocksPorts assigns persistent localhost SOCKS5 ports for per-exit channels.
-// Returns true if any new ports were assigned (metadata needs saving).
 func assignExitSocksPorts(meta *Metadata, channels []PerExitChannel) bool {
 	if meta.ExitSocksPorts == nil {
 		meta.ExitSocksPorts = make(map[string]int)
@@ -140,7 +215,6 @@ func assignExitSocksPorts(meta *Metadata, channels []PerExitChannel) bool {
 			log.Printf("[reconcile] assigned socks5 port %d for exit %s", port, ch.ExitName)
 		}
 	}
-	// Clean up ports for exits no longer present
 	activeExits := map[string]bool{}
 	for _, ch := range channels {
 		activeExits[ch.ExitName] = true
@@ -160,7 +234,6 @@ func entryConfigNeedsUpdate(configData []byte, transits []TransitInfo, exits []E
 		return true
 	}
 
-	// Extract current outbound tags (semantic comparison, not JSON hash)
 	outbounds, ok := config["outbounds"].([]interface{})
 	if !ok {
 		return true
@@ -176,7 +249,6 @@ func entryConfigNeedsUpdate(configData []byte, transits []TransitInfo, exits []E
 		}
 	}
 
-	// Desired tags
 	desiredTags := map[string]bool{"gia-auto": true, "direct": true}
 	for _, t := range transits {
 		desiredTags["transit-"+t.Name] = true
@@ -191,7 +263,6 @@ func entryConfigNeedsUpdate(configData []byte, transits []TransitInfo, exits []E
 		desiredTags["via-transit-exit-"+ch.ExitName] = true
 	}
 
-	// Compare tag sets
 	if len(currentTags) != len(desiredTags) {
 		return true
 	}
@@ -201,7 +272,6 @@ func entryConfigNeedsUpdate(configData []byte, transits []TransitInfo, exits []E
 		}
 	}
 
-	// Also check per-exit inbound count
 	currentExitInbounds := 0
 	if inbounds, ok := config["inbounds"].([]interface{}); ok {
 		for _, ib := range inbounds {
@@ -222,7 +292,6 @@ func entryConfigNeedsUpdate(configData []byte, transits []TransitInfo, exits []E
 	return false
 }
 
-// buildPerExitSocksInbounds creates localhost SOCKS5 inbound configs for per-exit channels.
 func buildPerExitSocksInbounds(channels []PerExitChannel, meta *Metadata) []map[string]interface{} {
 	var result []map[string]interface{}
 	for _, ch := range channels {
@@ -240,15 +309,12 @@ func buildPerExitSocksInbounds(channels []PerExitChannel, meta *Metadata) []map[
 	return result
 }
 
-// rebuildEntryConfig preserves existing main inbounds, adds per-exit SOCKS5 inbounds,
-// regenerates outbounds + route.
 func rebuildEntryConfig(currentData []byte, meta *Metadata, transits []TransitInfo, exits []ExitInfo, channels []PerExitChannel) ([]byte, error) {
 	var config map[string]interface{}
 	if err := json.Unmarshal(currentData, &config); err != nil {
 		return nil, err
 	}
 
-	// Preserve main inbounds (vless-in, hy2-in, socks-in), remove old socks-exit-* inbounds
 	var mainInbounds []interface{}
 	if existingIBs, ok := config["inbounds"].([]interface{}); ok {
 		for _, ib := range existingIBs {
@@ -258,23 +324,18 @@ func rebuildEntryConfig(currentData []byte, meta *Metadata, transits []TransitIn
 			}
 			tag, _ := ibMap["tag"].(string)
 			if len(tag) > 11 && tag[:11] == "socks-exit-" {
-				continue // remove old per-exit inbounds, will re-add below
+				continue
 			}
 			mainInbounds = append(mainInbounds, ib)
 		}
 	}
-
-	// Add per-exit SOCKS5 inbounds
 	for _, socksIB := range buildPerExitSocksInbounds(channels, meta) {
 		mainInbounds = append(mainInbounds, socksIB)
 	}
 	config["inbounds"] = mainInbounds
 
-	// Build outbounds: standard entry outbounds (strip trailing direct),
-	// add per-exit channel outbounds, then re-add direct.
 	outbounds := BuildEntryOutbounds(transits, exits)
 	outbounds = outbounds[:len(outbounds)-1] // remove trailing direct
-
 	for _, ch := range channels {
 		outbounds = append(outbounds, map[string]interface{}{
 			"type":        "socks",
@@ -285,18 +346,13 @@ func rebuildEntryConfig(currentData []byte, meta *Metadata, transits []TransitIn
 			"password":    ch.Password,
 		})
 	}
-
-	outbounds = append(outbounds,
-		map[string]interface{}{"type": "direct", "tag": "direct"},
-	)
+	outbounds = append(outbounds, map[string]interface{}{"type": "direct", "tag": "direct"})
 	config["outbounds"] = outbounds
 
-	// Build route with per-exit inbound rules at highest priority
 	socks5Rule := extractSocks5Rules(config)
 	route := BuildEntryRoute(exits, 0, nil)
 	rules := route["rules"].([]interface{})
 
-	// Insert per-exit inbound rules after DNS + private IP rules (index 2)
 	var perExitRules []interface{}
 	for _, ch := range channels {
 		perExitRules = append(perExitRules, map[string]interface{}{
@@ -307,12 +363,11 @@ func rebuildEntryConfig(currentData []byte, meta *Metadata, transits []TransitIn
 	}
 	if len(perExitRules) > 0 {
 		newRules := make([]interface{}, 0, len(rules)+len(perExitRules))
-		newRules = append(newRules, rules[:2]...)    // DNS + private IP
-		newRules = append(newRules, perExitRules...)  // per-exit (highest priority)
-		newRules = append(newRules, rules[2:]...)     // CN, AI, default
+		newRules = append(newRules, rules[:2]...)
+		newRules = append(newRules, perExitRules...)
+		newRules = append(newRules, rules[2:]...)
 		route["rules"] = newRules
 	}
-
 	if socks5Rule != nil {
 		r := route["rules"].([]interface{})
 		route["rules"] = append(r, socks5Rule)
@@ -326,10 +381,7 @@ func rebuildEntryConfig(currentData []byte, meta *Metadata, transits []TransitIn
 // Transit reconcile
 // =============================================================================
 
-func ReconcileTransitConfig(meta *Metadata, store *TopoStore) error {
-	downstreams := store.GetDownstreams()
-
-	// Extract alive exits (may be empty if all exits are down or pruned)
+func ReconcileTransitConfig(meta *Metadata, downstreams []TopologyTree) error {
 	var exits []ExitInfo
 	for _, ds := range downstreams {
 		if !ds.Self.Alive || ds.Self.Role != RoleExit {
@@ -342,7 +394,6 @@ func ReconcileTransitConfig(meta *Metadata, store *TopoStore) error {
 	}
 	sort.Slice(exits, func(i, j int) bool { return exits[i].Name < exits[j].Name })
 
-	// Assign/persist per-exit inbound ports
 	portsChanged := assignTransitExitPorts(meta, exits)
 
 	ConfigMu.Lock()
@@ -364,20 +415,17 @@ func ReconcileTransitConfig(meta *Metadata, store *TopoStore) error {
 		return err
 	}
 
-	// Persist port assignments
 	if portsChanged {
 		if err := meta.Save(); err != nil {
 			log.Printf("[reconcile] save metadata error: %v", err)
 		}
 	}
 
-	// Update metadata inbounds to include per-exit entries (for topology reporting)
 	updateTransitInboundMeta(meta, exits)
 	if err := meta.Save(); err != nil {
 		log.Printf("[reconcile] save metadata error: %v", err)
 	}
 
-	// Open firewall for new per-exit ports
 	for _, e := range exits {
 		if port, ok := meta.ExitPorts[e.Name]; ok {
 			FirewallAddPort(port, "tcp")
@@ -405,7 +453,7 @@ func assignTransitExitPorts(meta *Metadata, exits []ExitInfo) bool {
 		if _, exists := meta.ExitAuth[e.Name]; !exists {
 			pw, err := GeneratePassword(16)
 			if err != nil {
-				pw = e.Name // fallback
+				pw = e.Name
 			}
 			meta.ExitAuth[e.Name] = pw
 			changed = true
@@ -430,8 +478,6 @@ func transitConfigNeedsUpdate(configData []byte, exits []ExitInfo, meta *Metadat
 	if err := json.Unmarshal(configData, &config); err != nil {
 		return true
 	}
-
-	// Semantic comparison: check if exit outbound tags match
 	outbounds, ok := config["outbounds"].([]interface{})
 	if !ok {
 		return true
@@ -447,12 +493,10 @@ func transitConfigNeedsUpdate(configData []byte, exits []ExitInfo, meta *Metadat
 			currentExitTags[tag] = true
 		}
 	}
-
 	desiredExitTags := map[string]bool{}
 	for _, e := range exits {
 		desiredExitTags["exit-"+e.Name] = true
 	}
-
 	if len(currentExitTags) != len(desiredExitTags) {
 		return true
 	}
@@ -501,7 +545,6 @@ func rebuildTransitConfig(currentData []byte, meta *Metadata, exits []ExitInfo) 
 		return nil, err
 	}
 
-	// Preserve main inbounds, remove old for-exit-* inbounds
 	var mainInbounds []interface{}
 	if existingIBs, ok := config["inbounds"].([]interface{}); ok {
 		for _, ib := range existingIBs {
@@ -520,14 +563,8 @@ func rebuildTransitConfig(currentData []byte, meta *Metadata, exits []ExitInfo) 
 		mainInbounds = append(mainInbounds, perExitIB)
 	}
 	config["inbounds"] = mainInbounds
-
-	// Outbounds: direct + per-exit outbounds
 	config["outbounds"] = buildTransitOutbounds(exits)
 
-	// Route: sniff first (restore domain from TLS SNI for rule_set matching),
-	// then per-exit inbound routing, then default direct.
-	// Sniff is critical: upstream may use fake-ip, so Transit sees 198.18.x.x
-	// instead of real domains. Sniff extracts domain from TLS ClientHello/HTTP Host.
 	rules := []interface{}{
 		map[string]interface{}{"action": "sniff"},
 	}
@@ -547,17 +584,13 @@ func rebuildTransitConfig(currentData []byte, meta *Metadata, exits []ExitInfo) 
 	return json.MarshalIndent(config, "", "  ")
 }
 
-// updateTransitInboundMeta updates metadata.Inbounds to include per-exit entries
-// so they appear in topology reports to Entry.
 func updateTransitInboundMeta(meta *Metadata, exits []ExitInfo) {
-	// Keep only main inbounds (non-for-exit)
 	var main []InboundMeta
 	for _, inb := range meta.Inbounds {
 		if inb.ForExit == "" {
 			main = append(main, inb)
 		}
 	}
-	// Add per-exit inbound metadata (with auth for topology reporting)
 	for _, e := range exits {
 		port, ok := meta.ExitPorts[e.Name]
 		if !ok {
@@ -651,7 +684,7 @@ func pickBestInbound(node NodeInfo) *TransitInfo {
 	for i := range node.Inbounds {
 		inb := &node.Inbounds[i]
 		if inb.ForExit != "" {
-			continue // skip per-exit channel inbounds
+			continue
 		}
 		if inb.Protocol != "hysteria2" && inb.Protocol != "vless" {
 			continue
@@ -666,11 +699,9 @@ func pickBestInbound(node NodeInfo) *TransitInfo {
 		return nil
 	}
 
-	// For VLESS Reality, SNI should be the handshake domain (e.g. www.walmart.com),
-	// not the node's actual address. When node has no real domain, use default.
 	sni := node.Domain
 	if best.Protocol == "vless" && best.PublicKey != "" {
-		sni = "www.walmart.com" // Reality SNI must match handshake server
+		sni = "www.walmart.com"
 	}
 
 	return &TransitInfo{
@@ -687,7 +718,6 @@ func pickBestInbound(node NodeInfo) *TransitInfo {
 	}
 }
 
-// configNeedsUpdate is used by failover (which only changes outbound order).
 func configNeedsUpdate(configData []byte, transits []TransitInfo, exits []ExitInfo) bool {
 	var config map[string]interface{}
 	if err := json.Unmarshal(configData, &config); err != nil {
@@ -732,7 +762,6 @@ func extractSocks5Rules(config map[string]interface{}) interface{} {
 	return nil
 }
 
-// AllocatePort finds a random available port, for use with metadata persistence.
 func AllocatePort(min, max int, exclude map[string]int) int {
 	used := map[int]bool{}
 	for _, p := range exclude {
@@ -746,4 +775,3 @@ func AllocatePort(min, max int, exclude map[string]int) int {
 	}
 	return GenerateRandomPort(min, max)
 }
-

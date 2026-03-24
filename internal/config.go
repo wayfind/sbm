@@ -80,6 +80,10 @@ type Metadata struct {
 
 	BWG *BWGConfig `json:"bwg,omitempty"`
 
+	// Cloudflare Workers KV topology registry
+	CFWorkerURL string `json:"cf_worker_url,omitempty"`
+	CFAPIKey    string `json:"cf_api_key,omitempty"`
+
 	// Per-exit channel state (persisted for stability across restarts)
 	ExitPorts      map[string]int    `json:"exit_ports,omitempty"`       // transit: exit_name → per-exit inbound port
 	ExitAuth       map[string]string `json:"exit_auth,omitempty"`        // transit: exit_name → per-exit socks auth password

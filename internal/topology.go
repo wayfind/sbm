@@ -122,16 +122,24 @@ func BuildTopologyTree(meta *Metadata, store *TopoStore) TopologyTree {
 // --- HTTP handlers ---
 
 // BearerAuth is middleware that checks Authorization: Bearer <token>.
+// Also accepts ?token= query parameter (for browser access to dashboard).
 func BearerAuth(token string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if token == "" {
-			// No auth configured, allow all
 			next(w, r)
 			return
 		}
+		// Check header first
+		given := ""
 		auth := r.Header.Get("Authorization")
-		given := strings.TrimPrefix(auth, "Bearer ")
-		if !strings.HasPrefix(auth, "Bearer ") || subtle.ConstantTimeCompare([]byte(given), []byte(token)) != 1 {
+		if strings.HasPrefix(auth, "Bearer ") {
+			given = strings.TrimPrefix(auth, "Bearer ")
+		}
+		// Fallback to query param
+		if given == "" {
+			given = r.URL.Query().Get("token")
+		}
+		if given == "" || subtle.ConstantTimeCompare([]byte(given), []byte(token)) != 1 {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -204,34 +212,61 @@ func HandleReport(store *TopoStore) http.HandlerFunc {
 // --- Topology reporter (runs as goroutine) ---
 
 // StartTopologyReporter starts a goroutine that periodically reports this node's
-// topology tree to all upstream nodes.
-func StartTopologyReporter(meta *Metadata, store *TopoStore, interval time.Duration) {
-	if len(meta.Upstreams) == 0 {
-		log.Println("[topology] no upstreams configured, reporter not started")
+// info via two channels: Cloudflare KV (if configured) and chain /report (if upstreams configured).
+func StartTopologyReporter(meta *Metadata, store *TopoStore, cfClient *CFTopoClient, interval time.Duration) {
+	hasChain := len(meta.Upstreams) > 0
+	hasCF := cfClient != nil
+
+	if !hasChain && !hasCF {
+		log.Println("[topology] no upstreams and no CF configured, reporter not started")
 		return
 	}
 
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
+	var chainClient *http.Client
+	if hasChain {
+		chainClient = &http.Client{
+			Timeout: 10 * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
+		}
 	}
 
 	go func() {
-		// Initial report after short delay
 		time.Sleep(5 * time.Second)
-		reportToUpstreams(meta, store, client)
+		doReport(meta, store, cfClient, chainClient)
 
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for range ticker.C {
-			reportToUpstreams(meta, store, client)
+			doReport(meta, store, cfClient, chainClient)
 			store.Prune()
 		}
 	}()
 
-	log.Printf("[topology] reporter started, interval=%s, upstreams=%d", interval, len(meta.Upstreams))
+	channels := []string{}
+	if hasCF {
+		channels = append(channels, "CF")
+	}
+	if hasChain {
+		channels = append(channels, "chain")
+	}
+	log.Printf("[topology] reporter started, interval=%s, channels=%v", interval, channels)
+}
+
+func doReport(meta *Metadata, store *TopoStore, cfClient *CFTopoClient, chainClient *http.Client) {
+	// Channel A: Cloudflare KV
+	if cfClient != nil {
+		info := BuildNodeInfo(meta)
+		if err := cfClient.ReportNode(info); err != nil {
+			log.Printf("[topology] CF report error: %v", err)
+		}
+	}
+
+	// Channel B: Chain /report to upstreams
+	if chainClient != nil && len(meta.Upstreams) > 0 {
+		reportToUpstreams(meta, store, chainClient)
+	}
 }
 
 func reportToUpstreams(meta *Metadata, store *TopoStore, client *http.Client) {

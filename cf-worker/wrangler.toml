@@ -1,0 +1,14 @@
+name = "sbm-topo"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+routes = [
+  { pattern = "tun.vspeak.top", custom_domain = true }
+]
+
+[[kv_namespaces]]
+binding = "TOPO_KV"
+id = "84592dc002e048f789f6e14ce2571189"
+
+[vars]
+API_KEY = "sbm-topo-k8xPmQ2vNfW7rYzJ"

@@ -64,12 +64,19 @@ func RunServe(args []string) error {
 		mux.HandleFunc("/api/users", internal.BearerAuth(meta.APIToken, makeAPIUsersHandler(usersDB)))
 	}
 
-	// Start topology reporter (reports to upstreams)
-	internal.StartTopologyReporter(meta, topoStore, 30*time.Second)
+	// Initialize CF topology client (if configured)
+	var cfClient *internal.CFTopoClient
+	if meta.CFWorkerURL != "" && meta.CFAPIKey != "" {
+		cfClient = internal.NewCFTopoClient(meta.CFWorkerURL, meta.CFAPIKey)
+		log.Printf("[cf] topology client initialized: %s", meta.CFWorkerURL)
+	}
+
+	// Start topology reporter (dual channel: CF + chain)
+	internal.StartTopologyReporter(meta, topoStore, cfClient, 30*time.Second)
 
 	// Topology-driven auto-config (entry + transit)
 	if meta.Role == internal.RoleEntry || meta.Role == internal.RoleTransit {
-		internal.StartReconcileLoop(meta, topoStore, 30*time.Second)
+		internal.StartReconcileLoop(meta, topoStore, cfClient, 30*time.Second)
 	}
 
 	// Traffic collector + quota enforcement (entry only)
