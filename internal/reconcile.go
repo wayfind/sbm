@@ -338,6 +338,28 @@ func entryConfigNeedsUpdate(configData []byte, transits []TransitInfo, exits []E
 		return true
 	}
 
+	// Check residential selector default (daily rotation)
+	if len(exits) > 0 {
+		exitTags := make([]string, len(exits))
+		for i, e := range exits {
+			exitTags[i] = "exit-" + e.Name
+		}
+		desiredDefault := dailyStickyExit(exitTags)
+		for _, ob := range outbounds {
+			obMap, ok := ob.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if obMap["tag"] == "residential" {
+				currentDefault, _ := obMap["default"].(string)
+				if currentDefault != desiredDefault {
+					return true
+				}
+				break
+			}
+		}
+	}
+
 	return false
 }
 
