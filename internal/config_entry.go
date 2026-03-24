@@ -258,8 +258,9 @@ func BuildProxyOutbound(tag string, t *TransitInfo) map[string]interface{} {
 // buildExitOutbound creates an exit outbound that chains through a transit node.
 func buildExitOutbound(tag string, e *ExitInfo) map[string]interface{} {
 	out := BuildProxyOutbound(tag, &e.TransitInfo)
+	// Chain through any available transit via urltest auto-selection
 	if e.ViaTransit != "" {
-		out["detour"] = "transit-" + e.ViaTransit
+		out["detour"] = "gia-auto"
 	}
 	return out
 }
