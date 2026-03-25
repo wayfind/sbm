@@ -307,39 +307,22 @@ func entryConfigNeedsUpdate(configData []byte, transits []TransitInfo, exits []E
 		return true
 	}
 
-	outbounds, ok := config["outbounds"].([]interface{})
+	// Compare desired outbounds JSON against current (catches address/port/password changes)
+	desiredOutbounds := BuildEntryOutbounds(transits, exits)
+	desiredJSON, err := json.Marshal(desiredOutbounds)
+	if err != nil {
+		return true
+	}
+	currentOutbounds, ok := config["outbounds"]
 	if !ok {
 		return true
 	}
-	currentTags := map[string]bool{}
-	for _, ob := range outbounds {
-		obMap, ok := ob.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		if tag, ok := obMap["tag"].(string); ok {
-			currentTags[tag] = true
-		}
-	}
-
-	desiredTags := map[string]bool{"gia-auto": true, "direct": true}
-	for _, t := range transits {
-		desiredTags["transit-"+t.Name] = true
-	}
-	for _, e := range exits {
-		desiredTags["exit-"+e.Name] = true
-	}
-	if len(exits) > 0 {
-		desiredTags["residential"] = true
-	}
-
-	if len(currentTags) != len(desiredTags) {
+	currentJSON, err := json.Marshal(currentOutbounds)
+	if err != nil {
 		return true
 	}
-	for tag := range desiredTags {
-		if !currentTags[tag] {
-			return true
-		}
+	if string(desiredJSON) != string(currentJSON) {
+		return true
 	}
 
 	// Check per-exit inbound count
@@ -358,28 +341,6 @@ func entryConfigNeedsUpdate(configData []byte, transits []TransitInfo, exits []E
 	}
 	if currentExitInbounds != len(exits) {
 		return true
-	}
-
-	// Check residential selector default (daily rotation)
-	if len(exits) > 0 {
-		exitTags := make([]string, len(exits))
-		for i, e := range exits {
-			exitTags[i] = "exit-" + e.Name
-		}
-		desiredDefault := dailyStickyExit(exitTags)
-		for _, ob := range outbounds {
-			obMap, ok := ob.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			if obMap["tag"] == "residential" {
-				currentDefault, _ := obMap["default"].(string)
-				if currentDefault != desiredDefault {
-					return true
-				}
-				break
-			}
-		}
 	}
 
 	return false

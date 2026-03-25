@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"crypto/tls"
 	"database/sql"
 	"encoding/json"
@@ -9,8 +10,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"sing-box-manager/internal"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -123,7 +126,25 @@ func RunServe(args []string) error {
 	}
 
 	log.Printf("subscription server listening on :%d (role=%s)", listenPort, meta.Role)
-	return srv.ListenAndServeTLS("", "")
+
+	// Graceful shutdown on SIGINT/SIGTERM
+	done := make(chan error, 1)
+	go func() {
+		done <- srv.ListenAndServeTLS("", "")
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	select {
+	case err := <-done:
+		return err
+	case sig := <-quit:
+		log.Printf("received %s, shutting down...", sig)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return srv.Shutdown(ctx)
+	}
 }
 
 // stripServerHeader wraps a handler to explicitly remove the Server header.

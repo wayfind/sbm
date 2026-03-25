@@ -307,12 +307,12 @@ func BuildEntryOutbounds(transits []TransitInfo, exits []ExitInfo) []interface{}
 		}
 		// Daily sticky: pick one exit per day, rotate daily
 		// All AI traffic goes through the same exit IP for the entire day
-		todayExit := dailyStickyExit(exitTags)
+		defaultExit := stickyFirstExit(exitTags)
 		outbounds = append(outbounds, map[string]interface{}{
 			"type":      "selector",
 			"tag":       "residential",
 			"outbounds": exitTags,
-			"default":   todayExit,
+			"default":   defaultExit,
 		})
 	}
 
@@ -323,11 +323,10 @@ func BuildEntryOutbounds(transits []TransitInfo, exits []ExitInfo) []interface{}
 	return outbounds
 }
 
-// dailyStickyExit picks the first exit tag as default.
-// Sticky: stays on the same exit until it goes offline.
+// stickyFirstExit picks the first exit tag as the selector default.
 // When an exit goes offline, reconcile removes it from the list,
 // and the next available exit becomes the new default.
-func dailyStickyExit(exitTags []string) string {
+func stickyFirstExit(exitTags []string) string {
 	if len(exitTags) == 0 {
 		return ""
 	}
