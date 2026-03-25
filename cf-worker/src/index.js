@@ -689,11 +689,12 @@ export default {
       return Response.json({ status: 'ok' });
     }
 
-    // GET /nodes — list all
+    // GET /nodes — list all (skip user/* keys)
     if (request.method === 'GET' && path === '/nodes') {
       const list = await env.TOPO_KV.list();
       const nodes = [];
       for (const key of list.keys) {
+        if (key.name.startsWith('user/')) continue;
         const val = await env.TOPO_KV.get(key.name);
         if (val) {
           try { nodes.push(JSON.parse(val)); } catch {}
