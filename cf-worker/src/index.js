@@ -429,16 +429,16 @@ function renderUsers() {
     var pctClass = pct > 90 ? 'danger' : (pct > 70 ? 'warn' : '');
     rows += '<tr class="' + (u.enabled ? '' : 'disabled-row') + '">';
     rows += '<td><span class="user-name">' + u.name + '</span> ';
-    rows += '<button class="btn-icon" onclick="toggleUserDetail(\'' + u.name + '\')">&#9662;</button></td>';
+    rows += '<button class="btn-icon" onclick="toggleUserDetail(\\'' + u.name + '\\')">&#9662;</button></td>';
     rows += '<td><span class="status-dot ' + (u.enabled ? 'enabled' : 'disabled') + '"></span> ' + (u.enabled ? '启用' : '禁用') + '</td>';
     rows += '<td>' + formatBytes(u.bytes_total) + '</td>';
     rows += '<td>' + (u.quota_gb > 0 ? u.quota_gb + ' GB' : '无限') + '</td>';
     rows += '<td><div class="progress-bar"><div class="progress-fill ' + pctClass + '" style="width:' + pct + '%"></div></div></td>';
     rows += '<td><div class="actions-cell">';
-    rows += '<button class="btn-sm" onclick="editQuota(\'' + u.name + '\',' + (u.quota_gb || 0) + ')">配额</button>';
-    rows += '<button class="btn-sm" onclick="toggleUser(\'' + u.name + '\',' + u.enabled + ')">' + (u.enabled ? '禁用' : '启用') + '</button>';
-    rows += '<button class="btn-sm btn-danger" onclick="deleteUser(\'' + u.name + '\')">删除</button>';
-    rows += '<button class="btn-sm" onclick="resetTraffic(\'' + u.name + '\')">重置</button>';
+    rows += '<button class="btn-sm" onclick="editQuota(\\'' + u.name + '\\',' + (u.quota_gb || 0) + ')">配额</button>';
+    rows += '<button class="btn-sm" onclick="toggleUser(\\'' + u.name + '\\',' + u.enabled + ')">' + (u.enabled ? '禁用' : '启用') + '</button>';
+    rows += '<button class="btn-sm btn-danger" onclick="deleteUser(\\'' + u.name + '\\')">删除</button>';
+    rows += '<button class="btn-sm" onclick="resetTraffic(\\'' + u.name + '\\')">重置</button>';
     rows += '</div></td></tr>';
 
     // Detail row
