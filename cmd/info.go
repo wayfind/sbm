@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-const sbmVersion = "2.2.0"
+const sbmVersion = "2.3.0"
 
 func RunConfig() error {
 	data, err := os.ReadFile(internal.ConfigPath())
