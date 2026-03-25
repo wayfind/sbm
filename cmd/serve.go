@@ -48,10 +48,16 @@ func RunServe(args []string) error {
 		}
 	}
 
+	// Migrate legacy node-level credentials to named user (entry only, idempotent)
+	if usersDB != nil {
+		if err := internal.EnsureDefaultUser(usersDB, meta); err != nil {
+			log.Printf("[users] default user migration: %v", err)
+		}
+	}
+
 	mux := http.NewServeMux()
 
-	// Subscription endpoints
-	mux.HandleFunc("/sub/hz-office", handleSub) // legacy
+	// Subscription endpoint (all users including hz-office go through per-user path)
 	mux.HandleFunc("/sub/", makeUserSubHandler(usersDB))
 
 	// Topology API endpoints
@@ -79,7 +85,7 @@ func RunServe(args []string) error {
 
 	// Topology-driven auto-config (entry only — transit is pure relay, no reconcile needed)
 	if meta.Role == internal.RoleEntry {
-		internal.StartReconcileLoop(meta, topoStore, cfClient, 1*time.Minute)
+		internal.StartReconcileLoop(meta, topoStore, cfClient, usersDB, 1*time.Minute)
 	}
 
 	// Traffic collector + quota enforcement (entry only)
@@ -120,27 +126,6 @@ func RunServe(args []string) error {
 	return srv.ListenAndServeTLS("", "")
 }
 
-func handleSub(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-
-	sub, err := internal.GenerateSubscription()
-	if err != nil {
-		log.Printf("generate subscription error: %v", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	data := []byte(sub)
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
-	if r.Method == http.MethodGet {
-		w.Write(data)
-	}
-}
-
 // stripServerHeader wraps a handler to explicitly remove the Server header.
 func stripServerHeader(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -172,8 +157,8 @@ func makeUserSubHandler(db *sql.DB) http.HandlerFunc {
 
 		path := strings.TrimPrefix(r.URL.Path, "/sub/")
 		username := strings.TrimSuffix(path, "/")
-		if username == "" || username == "hz-office" {
-			handleSub(w, r)
+		if username == "" {
+			http.Error(w, "missing username in /sub/<username>", http.StatusBadRequest)
 			return
 		}
 

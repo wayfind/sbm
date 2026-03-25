@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"database/sql"
 	"encoding/json"
 	"log"
 	"os"
@@ -16,7 +17,7 @@ var ConfigMu sync.Mutex
 // StartReconcileLoop starts periodic reconciliation.
 // Entry: auto-configure transit/exit outbounds from topology.
 // Transit: only reports to CF (no config changes needed — pure relay).
-func StartReconcileLoop(meta *Metadata, store *TopoStore, cfClient *CFTopoClient, interval time.Duration) {
+func StartReconcileLoop(meta *Metadata, store *TopoStore, cfClient *CFTopoClient, db *sql.DB, interval time.Duration) {
 	if meta.Role != RoleEntry {
 		log.Printf("[reconcile] role=%s, no reconcile needed (transit is pure relay)", meta.Role)
 		return
@@ -27,7 +28,7 @@ func StartReconcileLoop(meta *Metadata, store *TopoStore, cfClient *CFTopoClient
 
 		for {
 			downstreams := getTopoFromDualView(meta, store, cfClient)
-			if err := ReconcileEntryConfig(meta, downstreams); err != nil {
+			if err := ReconcileEntryConfig(meta, downstreams, db); err != nil {
 				log.Printf("[reconcile] error: %v", err)
 			}
 			time.Sleep(interval)
@@ -109,7 +110,7 @@ func cfNodesToDownstreams(nodes []NodeInfo, meta *Metadata) []TopologyTree {
 // Entry reconcile — transit outbounds + exit outbounds (detour) + per-exit SOCKS5
 // =============================================================================
 
-func ReconcileEntryConfig(meta *Metadata, downstreams []TopologyTree) error {
+func ReconcileEntryConfig(meta *Metadata, downstreams []TopologyTree, db *sql.DB) error {
 	if len(downstreams) == 0 {
 		return nil
 	}
@@ -120,6 +121,18 @@ func ReconcileEntryConfig(meta *Metadata, downstreams []TopologyTree) error {
 	if len(desiredTransits) == 0 {
 		log.Println("[reconcile] no alive transits, skipping")
 		return nil
+	}
+
+	// Load users from SQLite for inbound user sync
+	var desiredUsers []User
+	if db != nil {
+		users, err := GetEnabledUsers(db)
+		if err != nil {
+			log.Printf("[reconcile] WARNING: failed to load users from DB, preserving existing: %v", err)
+			// DB error → don't touch users (fail-safe)
+		} else {
+			desiredUsers = users
+		}
 	}
 
 	// Assign per-exit SOCKS5 ports (localhost, for application-layer routing)
@@ -133,13 +146,15 @@ func ReconcileEntryConfig(meta *Metadata, downstreams []TopologyTree) error {
 		return err
 	}
 
-	if !entryConfigNeedsUpdate(data, desiredTransits, desiredExits, meta) && !portsChanged {
+	usersChanged := desiredUsers != nil && inboundUsersNeedUpdate(data, desiredUsers)
+
+	if !entryConfigNeedsUpdate(data, desiredTransits, desiredExits, meta) && !portsChanged && !usersChanged {
 		return nil
 	}
 
-	log.Printf("[reconcile] entry update: %d transits, %d exits", len(desiredTransits), len(desiredExits))
+	log.Printf("[reconcile] entry update: %d transits, %d exits, %d users", len(desiredTransits), len(desiredExits), len(desiredUsers))
 
-	newData, err := rebuildEntryConfig(data, meta, desiredTransits, desiredExits)
+	newData, err := rebuildEntryConfig(data, meta, desiredTransits, desiredExits, desiredUsers)
 	if err != nil {
 		return err
 	}
@@ -367,10 +382,107 @@ func entryConfigNeedsUpdate(configData []byte, transits []TransitInfo, exits []E
 }
 
 // =============================================================================
+// Inbound user sync — diff detection + rebuild
+// =============================================================================
+
+// inboundUsersNeedUpdate compares current config's inbound user names against desired users.
+func inboundUsersNeedUpdate(configData []byte, desiredUsers []User) bool {
+	if len(desiredUsers) == 0 {
+		return false // all disabled — not a "change", preserve existing
+	}
+	var config map[string]interface{}
+	if err := json.Unmarshal(configData, &config); err != nil {
+		return true
+	}
+	currentNames := extractInboundUserNames(config)
+	if len(currentNames) != len(desiredUsers) {
+		return true
+	}
+	desiredNames := map[string]bool{}
+	for _, u := range desiredUsers {
+		desiredNames[u.Name] = true
+	}
+	for n := range currentNames {
+		if !desiredNames[n] {
+			return true
+		}
+	}
+	return false
+}
+
+// extractInboundUserNames extracts user names from vless-in/hy2-in inbounds.
+func extractInboundUserNames(config map[string]interface{}) map[string]bool {
+	names := map[string]bool{}
+	inbounds, ok := config["inbounds"].([]interface{})
+	if !ok {
+		return names
+	}
+	for _, ib := range inbounds {
+		ibMap, ok := ib.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		tag, _ := ibMap["tag"].(string)
+		if tag != "vless-in" && tag != "hy2-in" {
+			continue
+		}
+		users, ok := ibMap["users"].([]interface{})
+		if !ok {
+			continue
+		}
+		for _, u := range users {
+			uMap, ok := u.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if name, ok := uMap["name"].(string); ok && name != "" {
+				names[name] = true
+			}
+		}
+	}
+	return names
+}
+
+// syncInboundUsers replaces the users arrays in vless-in and hy2-in inbounds.
+func syncInboundUsers(inbounds []interface{}, users []User) []interface{} {
+	if len(users) == 0 {
+		return inbounds // don't clear users if list is empty (safety)
+	}
+
+	vlessUsers := make([]interface{}, 0, len(users))
+	hy2Users := make([]interface{}, 0, len(users))
+	for _, u := range users {
+		vlessUsers = append(vlessUsers, map[string]interface{}{
+			"name": u.Name, "uuid": u.UUID, "flow": "xtls-rprx-vision",
+		})
+		hy2Users = append(hy2Users, map[string]interface{}{
+			"name": u.Name, "password": u.Password,
+		})
+	}
+
+	for i, ib := range inbounds {
+		ibMap, ok := ib.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		tag, _ := ibMap["tag"].(string)
+		switch tag {
+		case "vless-in":
+			ibMap["users"] = vlessUsers
+			inbounds[i] = ibMap
+		case "hy2-in":
+			ibMap["users"] = hy2Users
+			inbounds[i] = ibMap
+		}
+	}
+	return inbounds
+}
+
+// =============================================================================
 // Config rebuild — preserves inbounds, regenerates outbounds + route
 // =============================================================================
 
-func rebuildEntryConfig(currentData []byte, meta *Metadata, transits []TransitInfo, exits []ExitInfo) ([]byte, error) {
+func rebuildEntryConfig(currentData []byte, meta *Metadata, transits []TransitInfo, exits []ExitInfo, users []User) ([]byte, error) {
 	var config map[string]interface{}
 	if err := json.Unmarshal(currentData, &config); err != nil {
 		return nil, err
@@ -404,6 +516,12 @@ func rebuildEntryConfig(currentData []byte, meta *Metadata, transits []TransitIn
 		})
 	}
 	config["inbounds"] = mainInbounds
+
+	// --- Sync inbound users from SQLite ---
+	if len(users) > 0 {
+		ibs, _ := config["inbounds"].([]interface{})
+		config["inbounds"] = syncInboundUsers(ibs, users)
+	}
 
 	// --- Outbounds: transit + exit (detour) + urltest groups ---
 	config["outbounds"] = BuildEntryOutbounds(transits, exits)

@@ -81,16 +81,13 @@ func GenerateEntryConfig(p *EntryParams) (map[string]interface{}, error) {
 	hy2Users := []map[string]interface{}{}
 	userNames := []string{}
 
-	if len(p.Users) > 0 {
-		for _, u := range p.Users {
-			vlessUsers = append(vlessUsers, map[string]interface{}{"name": u.Name, "uuid": u.UUID, "flow": "xtls-rprx-vision"})
-			hy2Users = append(hy2Users, map[string]interface{}{"name": u.Name, "password": u.Password})
-			userNames = append(userNames, u.Name)
-		}
-	} else {
-		// Fallback: single user from install params
-		vlessUsers = append(vlessUsers, map[string]interface{}{"uuid": p.UUID, "flow": "xtls-rprx-vision"})
-		hy2Users = append(hy2Users, map[string]interface{}{"password": p.Hy2Pass})
+	if len(p.Users) == 0 {
+		return nil, fmt.Errorf("entry node requires at least one user (run: sbm user add <name>)")
+	}
+	for _, u := range p.Users {
+		vlessUsers = append(vlessUsers, map[string]interface{}{"name": u.Name, "uuid": u.UUID, "flow": "xtls-rprx-vision"})
+		hy2Users = append(hy2Users, map[string]interface{}{"name": u.Name, "password": u.Password})
+		userNames = append(userNames, u.Name)
 	}
 
 	// VLESS Reality inbound (always, no domain needed)

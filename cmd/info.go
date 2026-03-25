@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -39,30 +38,45 @@ func RunSub() error {
 	if subPort == 0 {
 		subPort = 20033
 	}
-	subURL := fmt.Sprintf("https://%s:%d/sub/hz-office", meta.Domain, subPort)
+	subBase := fmt.Sprintf("https://%s:%d/sub", meta.Domain, subPort)
 
-	sub, err := internal.GenerateSubscription()
+	db, err := internal.OpenUsersDB()
 	if err != nil {
-		return fmt.Errorf("generate subscription: %w", err)
+		return fmt.Errorf("open users DB: %w", err)
 	}
-	decoded, err := base64.StdEncoding.DecodeString(sub)
+	defer db.Close()
+
+	users, err := internal.ListUsers(db)
 	if err != nil {
-		return err
+		return fmt.Errorf("list users: %w", err)
 	}
-	uris := strings.Split(strings.TrimSpace(string(decoded)), "\n")
 
 	if internal.JSONMode {
-		internal.PrintJSON(map[string]interface{}{
-			"url":            subURL,
-			"content_base64": sub,
-			"uris":           uris,
-		})
+		type subEntry struct {
+			Name    string `json:"name"`
+			URL     string `json:"url"`
+			Enabled bool   `json:"enabled"`
+		}
+		entries := make([]subEntry, len(users))
+		for i, u := range users {
+			entries[i] = subEntry{Name: u.Name, URL: subBase + "/" + u.Name, Enabled: u.Enabled}
+		}
+		internal.PrintJSON(entries)
 		return nil
 	}
 
-	fmt.Printf("订阅地址: %s\n\n", subURL)
-	fmt.Println("=== 解码内容 ===")
-	fmt.Println(string(decoded))
+	if len(users) == 0 {
+		fmt.Println("暂无用户，使用 sbm user add <name> 添加")
+		return nil
+	}
+	fmt.Println("订阅地址:")
+	for _, u := range users {
+		status := "✓"
+		if !u.Enabled {
+			status = "✗"
+		}
+		fmt.Printf("  %s %s/%s\n", status, subBase, u.Name)
+	}
 	return nil
 }
 

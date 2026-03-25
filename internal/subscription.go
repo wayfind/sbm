@@ -9,7 +9,6 @@ import (
 )
 
 // GenerateUserSubscription generates a subscription for a specific user.
-// If user is nil, generates legacy single-user subscription.
 func GenerateUserSubscription(user *UserWithTraffic) (string, error) {
 	meta, err := LoadMetadata()
 	if err != nil {
@@ -33,14 +32,8 @@ func GenerateUserSubscription(user *UserWithTraffic) (string, error) {
 				"pbk": {pbk}, "sid": {sid},
 				"fp": {"chrome"}, "sni": {"www.walmart.com"},
 			}
-			uuid := inb.UUID
-			name := "vless-reality"
-			if user != nil {
-				uuid = user.UUID
-				name = user.Name + "-vless"
-			}
 			uris = append(uris, fmt.Sprintf("vless://%s@%s:%d?%s#%s",
-				uuid, addr, inb.Port, params.Encode(), name))
+				user.UUID, addr, inb.Port, params.Encode(), user.Name+"-vless"))
 		}
 
 		if inb.Protocol == "hysteria2" && inb.ForExit == "" {
@@ -49,24 +42,13 @@ func GenerateUserSubscription(user *UserWithTraffic) (string, error) {
 				"sni": {addr}, "obfs": {"salamander"},
 				"obfs-password": {obfsPw}, "alpn": {"h3"},
 			}
-			password := inb.Password
-			name := "hysteria2"
-			if user != nil {
-				password = user.Password
-				name = user.Name + "-hy2"
-			}
 			uris = append(uris, fmt.Sprintf("hysteria2://%s@%s:%d?%s#%s",
-				url.QueryEscape(password), addr, inb.Port, params.Encode(), name))
+				url.QueryEscape(user.Password), addr, inb.Port, params.Encode(), user.Name+"-hy2"))
 		}
 	}
 
 	content := strings.Join(uris, "\n")
 	return base64.StdEncoding.EncodeToString([]byte(content)), nil
-}
-
-// GenerateSubscription generates legacy subscription (first user or install params).
-func GenerateSubscription() (string, error) {
-	return GenerateUserSubscription(nil)
 }
 
 // GenerateSubscriptionForUser generates subscription for a named user from SQLite.

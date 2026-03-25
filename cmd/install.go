@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -399,6 +400,23 @@ func installEntryNode(f *InstallFlags) error {
 
 	detectCertbot(f)
 
+	// Seed default user in SQLite (uses install-time credentials)
+	usersDB, dbErr := internal.OpenUsersDB()
+	if dbErr != nil {
+		return fmt.Errorf("open users db: %w", dbErr)
+	}
+	defer usersDB.Close()
+	if _, err := usersDB.Exec(
+		"INSERT OR IGNORE INTO users (name, uuid, password, quota_gb) VALUES (?, ?, ?, 0)",
+		"hz-office", cm.UUID, cm.Hy2Pass,
+	); err != nil {
+		log.Printf("[install] seed user: %v", err)
+	}
+	entryUsers, err := internal.GetEnabledUsers(usersDB)
+	if err != nil {
+		return fmt.Errorf("load users: %w", err)
+	}
+
 	// Entry config
 	entryParams := &internal.EntryParams{
 		Domain: f.Domain, VlessPort: f.VlessPort, Hy2Port: f.Hy2Port,
@@ -406,6 +424,7 @@ func installEntryNode(f *InstallFlags) error {
 		ShortID: cm.ShortID, Hy2Pass: cm.Hy2Pass, ObfsPass: cm.ObfsPass,
 		CertFile: f.CertFile, KeyFile: f.KeyFile,
 		Transits: upCfg.Transits, Exits: upCfg.Exits,
+		Users: entryUsers,
 	}
 	if upCfg.Socks5 != nil {
 		entryParams.Socks5Port = upCfg.Socks5.Port

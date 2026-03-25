@@ -85,7 +85,7 @@ func userAdd(db *sql.DB, args []string) error {
 		} else {
 			fmt.Printf("月限额:   无限\n")
 		}
-		fmt.Println("\n注意: 需要重启 sing-box 使新用户生效 (sbm restart)")
+		fmt.Println("\n变更将在 1 分钟内自动生效")
 	}
 	return nil
 }
@@ -101,7 +101,7 @@ func userDel(db *sql.DB, args []string) error {
 		internal.PrintJSON(map[string]string{"status": "deleted", "name": args[0]})
 	} else {
 		fmt.Printf("用户已删除: %s\n", args[0])
-		fmt.Println("注意: 需要重启 sing-box 使变更生效 (sbm restart)")
+		fmt.Println("变更将在 1 分钟内自动生效")
 	}
 	return nil
 }
@@ -173,7 +173,7 @@ func userEnable(db *sql.DB, args []string, enabled bool) error {
 		internal.PrintJSON(map[string]interface{}{"name": args[0], "enabled": enabled})
 	} else {
 		fmt.Printf("用户 %s 已%s\n", args[0], action)
-		fmt.Println("注意: 需要重启 sing-box 使变更生效 (sbm restart)")
+		fmt.Println("变更将在 1 分钟内自动生效")
 	}
 	return nil
 }

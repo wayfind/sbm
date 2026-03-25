@@ -3,6 +3,7 @@ package internal
 import (
 	"database/sql"
 	"fmt"
+	"log"
 	"path/filepath"
 	"time"
 
@@ -233,6 +234,47 @@ func ResetUserTraffic(db *sql.DB, name string) error {
 	month := CurrentMonth()
 	_, err := db.Exec("DELETE FROM traffic WHERE user_name = ? AND month = ?", name, month)
 	return err
+}
+
+// EnsureDefaultUser migrates the legacy node-level credentials into a named user.
+// Reads UUID/Password from metadata inbounds and inserts as "hz-office" if not exists.
+// Idempotent — safe to call on every startup.
+func EnsureDefaultUser(db *sql.DB, meta *Metadata) error {
+	const defaultName = "hz-office"
+
+	// Already exists?
+	var count int
+	if err := db.QueryRow("SELECT COUNT(*) FROM users WHERE name = ?", defaultName).Scan(&count); err != nil {
+		return fmt.Errorf("check default user: %w", err)
+	}
+	if count > 0 {
+		return nil
+	}
+
+	// Extract credentials from metadata inbounds
+	var uuid, password string
+	for _, inb := range meta.Inbounds {
+		if inb.Protocol == "vless" && inb.ForExit == "" && inb.UUID != "" {
+			uuid = inb.UUID
+		}
+		if inb.Protocol == "hysteria2" && inb.ForExit == "" && inb.Password != "" {
+			password = inb.Password
+		}
+	}
+	if uuid == "" || password == "" {
+		return fmt.Errorf("cannot migrate: no vless UUID or hy2 password in metadata inbounds")
+	}
+
+	_, err := db.Exec(
+		"INSERT OR IGNORE INTO users (name, uuid, password, quota_gb) VALUES (?, ?, ?, 0)",
+		defaultName, uuid, password,
+	)
+	if err != nil {
+		return fmt.Errorf("insert default user: %w", err)
+	}
+
+	log.Printf("[users] migrated node-level credentials to user %q", defaultName)
+	return nil
 }
 
 // CheckQuotas checks all users and disables those over quota. Returns names of newly disabled users.
