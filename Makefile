@@ -1,17 +1,20 @@
 VERSION := $(shell grep 'sbmVersion' cmd/info.go | head -1 | sed 's/.*"\(.*\)".*/\1/')
 SINGBOX_VERSION := 1.13.3
+SINGBOX_TAGS := with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_v2ray_api,with_tailscale,with_ccm,with_ocm
 
 build:
 	GOOS=linux GOARCH=amd64 go build -o sbm .
 
-# Download pinned sing-box release
+# Build sing-box from source with required tags (including with_v2ray_api)
 fetch-singbox:
-	curl -fsSL -o /tmp/sing-box.tar.gz \
-	  "https://github.com/SagerNet/sing-box/releases/download/v$(SINGBOX_VERSION)/sing-box-$(SINGBOX_VERSION)-linux-amd64.tar.gz"
-	tar -xf /tmp/sing-box.tar.gz -C /tmp --strip-components=1 "sing-box-$(SINGBOX_VERSION)-linux-amd64/sing-box"
-	mv /tmp/sing-box sing-box-linux-amd64
-	rm /tmp/sing-box.tar.gz
-	@echo "sing-box $(SINGBOX_VERSION) → sing-box-linux-amd64"
+	@if [ ! -d /tmp/sing-box-src ]; then \
+	  git clone --depth 1 --branch v$(SINGBOX_VERSION) https://github.com/SagerNet/sing-box.git /tmp/sing-box-src; \
+	fi
+	cd /tmp/sing-box-src && GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
+	  go build -tags "$(SINGBOX_TAGS)" -trimpath \
+	  -ldflags "-s -w -X 'github.com/sagernet/sing-box/constant.Version=$(SINGBOX_VERSION)'" \
+	  -o $(CURDIR)/sing-box-linux-amd64 ./cmd/sing-box
+	@echo "sing-box $(SINGBOX_VERSION) (custom build, tags: $(SINGBOX_TAGS)) → sing-box-linux-amd64"
 
 # Publish sbm + sing-box + install.sh to CF R2
 publish: build fetch-singbox

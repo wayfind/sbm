@@ -91,12 +91,12 @@ func RunServe(args []string) error {
 	// Traffic collector + quota enforcement (entry only)
 	if meta.Role == internal.RoleEntry && usersDB != nil {
 		internal.StartTrafficCollector(usersDB, 30*time.Second, func(disabled []string) {
-			log.Printf("[traffic] quota exceeded, disabling users %v → restarting sing-box", disabled)
-			// Restart sing-box so it drops connections from disabled users
-			// (reconcile will regenerate config with only enabled users on next cycle)
-			internal.ConfigMu.Lock()
-			defer internal.ConfigMu.Unlock()
-			internal.SystemctlOp("restart", "sing-box")
+			log.Printf("[traffic] quota exceeded, disabling users %v → reconcile now", disabled)
+			// Trigger immediate reconcile: rebuild config without disabled users + restart sing-box
+			downstreams := topoStore.GetDownstreams()
+			if err := internal.ReconcileEntryConfig(meta, downstreams, usersDB); err != nil {
+				log.Printf("[traffic] reconcile after quota disable failed: %v", err)
+			}
 		})
 	}
 
