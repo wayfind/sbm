@@ -4,11 +4,14 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sing-box-manager/internal"
+	"strings"
 	"time"
 )
 
@@ -23,6 +26,9 @@ type InstallFlags struct {
 	UpstreamsFile string
 	CertFile      string
 	KeyFile       string
+	Name          string
+	CFWorkerURL   string
+	CFAPIKey      string
 }
 
 // cryptoMaterials holds generated keys/passwords for a new installation.
@@ -48,6 +54,9 @@ func RunInstall(args []string) error {
 	fs.StringVar(&f.UpstreamsFile, "upstreams", "", "上游节点配置文件 (entry 必选)")
 	fs.StringVar(&f.CertFile, "cert", "", "TLS 证书文件路径 (替代 ACME)")
 	fs.StringVar(&f.KeyFile, "key", "", "TLS 私钥文件路径 (替代 ACME)")
+	fs.StringVar(&f.Name, "name", "", "节点名称 (拓扑显示用)")
+	fs.StringVar(&f.CFWorkerURL, "cf-url", "", "Cloudflare Worker URL (拓扑上报)")
+	fs.StringVar(&f.CFAPIKey, "cf-key", "", "Cloudflare API Key (拓扑认证)")
 	fs.Parse(args)
 
 	role := internal.NodeRole(f.Role)
@@ -61,6 +70,13 @@ func RunInstall(args []string) error {
 		f.Domain = promptString("请输入域名")
 		if f.Domain == "" {
 			return fmt.Errorf("域名不能为空")
+		}
+	}
+	// Exit node: auto-detect public IP if no domain given
+	if f.Domain == "" && role == internal.RoleExit {
+		if ip := detectPublicIP(); ip != "" {
+			f.Domain = ip
+			humanPrint("自动检测公网 IP: %s\n", ip)
 		}
 	}
 	// --json implies --force (AI mode = non-interactive)
@@ -301,8 +317,11 @@ func installServerNode(role internal.NodeRole, f *InstallFlags) error {
 
 	meta := &internal.Metadata{
 		Version: 2, Role: role, NodeID: nodeID,
-		Domain: f.Domain, SubPort: f.SubPort,
-		Inbounds: inboundMetas,
+		Name: f.Name, Domain: f.Domain, SubPort: f.SubPort,
+		Inbounds:    inboundMetas,
+		CFWorkerURL: f.CFWorkerURL,
+		CFAPIKey:    f.CFAPIKey,
+		APIToken:    f.CFAPIKey, // use same key for API auth
 	}
 	if oldMeta != nil {
 		restoreMetaFields(meta, oldMeta)
@@ -464,8 +483,11 @@ func installEntryNode(f *InstallFlags) error {
 
 	meta := &internal.Metadata{
 		Version: 2, Role: internal.RoleEntry, NodeID: nodeID,
-		Domain: f.Domain, SubPort: f.SubPort,
+		Name: f.Name, Domain: f.Domain, SubPort: f.SubPort,
 		Inbounds: inboundMetas, Upstreams: upstreamMetas,
+		CFWorkerURL: f.CFWorkerURL,
+		CFAPIKey:    f.CFAPIKey,
+		APIToken:    f.CFAPIKey,
 	}
 	if oldMeta != nil {
 		restoreMetaFields(meta, oldMeta)
@@ -639,4 +661,25 @@ func humanPrint(format string, args ...interface{}) {
 func installRenewCron(sbmPath string) error {
 	content := fmt.Sprintf("17 3 * * 1 root %s renew\n", sbmPath)
 	return os.WriteFile("/etc/cron.d/renew-cert", []byte(content), 0644)
+}
+
+// detectPublicIP queries external services to find this machine's public IP.
+func detectPublicIP() string {
+	for _, url := range []string{"https://ifconfig.me", "https://api.ipify.org", "https://icanhazip.com"} {
+		client := &http.Client{Timeout: 5 * time.Second}
+		resp, err := client.Get(url)
+		if err != nil {
+			continue
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 64))
+		resp.Body.Close()
+		if err != nil || resp.StatusCode != 200 {
+			continue
+		}
+		ip := strings.TrimSpace(string(body))
+		if ip != "" {
+			return ip
+		}
+	}
+	return ""
 }

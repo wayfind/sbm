@@ -26,6 +26,10 @@ ROLE=""
 DOMAIN=""
 UPSTREAMS=""
 SKIP_INSTALL=""
+NAME=""
+CF_URL=""
+CF_KEY=""
+EXTRA_ARGS=()
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -33,18 +37,32 @@ while [ $# -gt 0 ]; do
         --domain)  DOMAIN="$2"; shift 2 ;;
         --upstreams) UPSTREAMS="$2"; shift 2 ;;
         --download-only) SKIP_INSTALL=1; shift ;;
+        --name)    NAME="$2"; shift 2 ;;
+        --cf-url)  CF_URL="$2"; shift 2 ;;
+        --cf-key)  CF_KEY="$2"; shift 2 ;;
+        --force)   EXTRA_ARGS+=(--force); shift ;;
+        --cert)    EXTRA_ARGS+=(--cert "$2"); shift 2 ;;
+        --key)     EXTRA_ARGS+=(--key "$2"); shift 2 ;;
+        --sni)     EXTRA_ARGS+=(--sni "$2"); shift 2 ;;
         -h|--help)
             echo "Usage: curl -fsSL $BASE_URL/install | bash -s -- [OPTIONS]"
             echo ""
             echo "Options:"
             echo "  --role <transit|exit|entry>  节点类型"
-            echo "  --domain <域名>             域名 (exit 不需要)"
+            echo "  --domain <域名>             域名 (exit 不需要，自动探测 IP)"
+            echo "  --name <名称>               节点名称 (拓扑显示用)"
+            echo "  --cf-url <URL>              Cloudflare Worker URL (拓扑上报)"
+            echo "  --cf-key <KEY>              Cloudflare API Key (拓扑认证)"
             echo "  --upstreams <文件>           上游配置文件 (entry 必需)"
+            echo "  --force                      跳过替换确认"
+            echo "  --cert <路径>                TLS 证书文件"
+            echo "  --key <路径>                 TLS 私钥文件"
+            echo "  --sni <SNI>                  VLESS Reality SNI"
             echo "  --download-only             仅下载二进制，不配置节点"
             echo ""
             echo "Examples:"
-            echo "  bash -s -- --role transit --domain node.example.com"
-            echo "  bash -s -- --role exit"
+            echo "  bash -s -- --role transit --domain node.example.com --name my-transit"
+            echo "  bash -s -- --role exit --name my-exit --cf-url https://tun.vspeak.top --cf-key xxx"
             echo "  bash -s -- --role entry --domain gw.example.com --upstreams /tmp/upstreams.json"
             exit 0
             ;;
@@ -196,6 +214,10 @@ fi
 cmd=(sbm install --role "$ROLE" --force)
 [ -n "$DOMAIN" ] && cmd+=(--domain "$DOMAIN")
 [ -n "$UPSTREAMS" ] && cmd+=(--upstreams "$UPSTREAMS")
+[ -n "$NAME" ] && cmd+=(--name "$NAME")
+[ -n "$CF_URL" ] && cmd+=(--cf-url "$CF_URL")
+[ -n "$CF_KEY" ] && cmd+=(--cf-key "$CF_KEY")
+cmd+=("${EXTRA_ARGS[@]}")
 
 info "执行: ${cmd[*]}"
 "${cmd[@]}"
@@ -203,6 +225,5 @@ info "执行: ${cmd[*]}"
 info "安装完成！"
 echo ""
 echo "下一步:"
-echo "  1. 编辑 /etc/sing-box/metadata.json 添加 name 和 api_token"
-echo "  2. 运行 sbm status 检查服务状态"
-echo "  3. 运行 sbm sub 查看订阅信息"
+echo "  1. 运行 sbm status 检查服务状态"
+echo "  2. 运行 sbm sub 查看订阅信息"
