@@ -354,7 +354,7 @@ async function load(){
     const tr=document.createElement('tr');
     tr.innerHTML='<td>'+u.name+'</td>'
       +'<td class="'+(u.enabled?'enabled':'disabled')+'">'+(u.enabled?'启用':'禁用')+'</td>'
-      +'<td>'+formatBytes(u.bytes_total)+'</td>'
+      +'<td title="↑ '+formatBytes(u.bytes_up)+' / ↓ '+formatBytes(u.bytes_down)+'">'+formatBytes(u.bytes_total)+'</td>'
       +'<td>'+(u.quota_gb>0?u.quota_gb+' GB':'无限')+'</td>'
       +'<td><div class="bar"><div class="bar-fill" style="width:'+pct+'%"></div><div class="bar-text">'+pct.toFixed(0)+'%</div></div></td>';
     tbody.appendChild(tr);

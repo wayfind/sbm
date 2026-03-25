@@ -289,9 +289,9 @@ func CheckQuotas(db *sql.DB) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
-	var disabled []string
+	// Collect over-quota users first, then close rows before writing
+	var overQuota []string
 	for rows.Next() {
 		var name string
 		var quotaGB float64
@@ -301,9 +301,19 @@ func CheckQuotas(db *sql.DB) ([]string, error) {
 		}
 		quotaBytes := int64(quotaGB * 1e9)
 		if totalBytes >= quotaBytes {
-			SetUserEnabled(db, name, false)
-			disabled = append(disabled, name)
+			overQuota = append(overQuota, name)
 		}
+	}
+	rows.Close()
+
+	// Now disable (rows closed, no read lock held)
+	var disabled []string
+	for _, name := range overQuota {
+		if err := SetUserEnabled(db, name, false); err != nil {
+			log.Printf("[quota] failed to disable %s: %v", name, err)
+			continue
+		}
+		disabled = append(disabled, name)
 	}
 	return disabled, nil
 }
