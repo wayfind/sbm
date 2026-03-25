@@ -24,11 +24,16 @@ func GenerateTransitConfig(p *InstallParams) *SBConfig {
 
 	return &SBConfig{
 		Log: SBLog{Level: "warn", Timestamp: true},
+		DNS: &SBDNS{
+			Servers: []SBDNSServer{
+				{Type: "tls", Tag: "remote", Server: "8.8.8.8"},
+			},
+		},
 		Inbounds: []SBInbound{
 			{
 				Type: "vless", Tag: "vless-in",
 				Listen: "::", ListenPort: p.VlessPort,
-				Users: []SBUser{{UUID: p.UUID, Flow: "xtls-rprx-vision"}},
+				Users: []SBUser{{Name: "relay", UUID: p.UUID, Flow: "xtls-rprx-vision"}},
 				TLS: &SBTLS{
 					Enabled:    true,
 					ServerName: "www.walmart.com",
@@ -43,7 +48,7 @@ func GenerateTransitConfig(p *InstallParams) *SBConfig {
 			{
 				Type: "hysteria2", Tag: "hy2-in",
 				Listen: "::", ListenPort: p.Hy2Port,
-				Users:                 []SBUser{{Password: p.Hy2Pass}},
+				Users:                 []SBUser{{Name: "relay", Password: p.Hy2Pass}},
 				IgnoreClientBandwidth: &ignoreBW,
 				Obfs:                  &SBObfs{Type: "salamander", Password: p.ObfsPass},
 				TLS:                   hy2TLS,

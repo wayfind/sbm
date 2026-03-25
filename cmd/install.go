@@ -195,7 +195,9 @@ func finishInstall(f *InstallFlags, role internal.NodeRole, extraTCPPorts ...int
 	if role != internal.RoleExit {
 		internal.FirewallAddPort(f.Hy2Port, "udp")
 	}
-	internal.FirewallAddPort(f.SubPort, "tcp")
+	if role == internal.RoleEntry {
+		internal.FirewallAddPort(f.SubPort, "tcp")
+	}
 	for _, p := range extraTCPPorts {
 		internal.FirewallAddPort(p, "tcp")
 	}

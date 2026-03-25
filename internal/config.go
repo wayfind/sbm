@@ -235,6 +235,7 @@ type SBLog struct {
 }
 
 type SBUser struct {
+	Name     string `json:"name,omitempty"`
 	UUID     string `json:"uuid,omitempty"`
 	Flow     string `json:"flow,omitempty"`
 	Password string `json:"password,omitempty"`
@@ -288,8 +289,19 @@ type SBOutbound struct {
 	Tag  string `json:"tag"`
 }
 
+type SBDNSServer struct {
+	Type   string `json:"type"`
+	Tag    string `json:"tag"`
+	Server string `json:"server,omitempty"`
+}
+
+type SBDNS struct {
+	Servers []SBDNSServer `json:"servers"`
+}
+
 type SBConfig struct {
 	Log       SBLog        `json:"log"`
+	DNS       *SBDNS       `json:"dns,omitempty"`
 	Inbounds  []SBInbound  `json:"inbounds"`
 	Outbounds []SBOutbound `json:"outbounds"`
 }

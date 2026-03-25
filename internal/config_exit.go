@@ -6,11 +6,16 @@ package internal
 func GenerateExitConfig(p *InstallParams) *SBConfig {
 	return &SBConfig{
 		Log: SBLog{Level: "warn", Timestamp: true},
+		DNS: &SBDNS{
+			Servers: []SBDNSServer{
+				{Type: "tls", Tag: "remote", Server: "8.8.8.8"},
+			},
+		},
 		Inbounds: []SBInbound{
 			{
 				Type: "vless", Tag: "vless-in",
 				Listen: "::", ListenPort: p.VlessPort,
-				Users: []SBUser{{UUID: p.UUID}},
+				Users: []SBUser{{Name: "relay", UUID: p.UUID}},
 				TLS: &SBTLS{
 					Enabled:    true,
 					ServerName: "www.walmart.com",
