@@ -446,7 +446,10 @@ function renderUsers() {
     rows += '<td colspan="6"><div class="detail-grid">';
     if (u.uuid) rows += '<div><b>UUID</b> <code>' + u.uuid + '</code></div>';
     if (u.password) rows += '<div><b>密码</b> <code>' + u.password + '</code></div>';
-    if (u.sub_url) rows += '<div><b>订阅</b> <code class="sub-url" onclick="copyText(this)">' + u.sub_url + '</code> <span class="copy-hint">点击复制</span></div>';
+    var subUrls = u.sub_urls || (u.sub_url ? [u.sub_url] : []);
+    for (var si = 0; si < subUrls.length; si++) {
+      rows += '<div><b>订阅' + (subUrls.length > 1 ? ' ' + (si + 1) : '') + '</b> <code class="sub-url" onclick="copyText(this)">' + subUrls[si] + '</code> <span class="copy-hint">点击复制</span></div>';
+    }
     rows += '</div></td></tr>';
   }
   tbody.innerHTML = rows;
