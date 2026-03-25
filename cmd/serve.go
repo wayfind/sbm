@@ -284,15 +284,18 @@ func makeAPIUsersRouter(db *sql.DB, meta *internal.Metadata, cfClient *internal.
 				jsonError(w, "name required", 400)
 				return
 			}
+			// Create user locally first (generates UUID/password)
 			user, err := internal.AddUser(db, req.Name, req.QuotaGB)
 			if err != nil {
 				jsonError(w, err.Error(), 400)
 				return
 			}
-			// Push to CF (best-effort: don't fail if CF is down)
+			// Push to CF — if fails, rollback local
 			if cfClient != nil {
 				if err := internal.PushUserToCF(db, cfClient, req.Name); err != nil {
-					log.Printf("[user-sync] push %s to CF error: %v", req.Name, err)
+					internal.DelUser(db, req.Name)
+					jsonError(w, "CF 不可用，无法添加用户: "+err.Error(), 503)
+					return
 				}
 			}
 			w.WriteHeader(201)

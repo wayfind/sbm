@@ -322,10 +322,18 @@ func assignExitPorts(meta *Metadata, exits []ExitInfo) bool {
 	}
 	for name := range meta.ExitSocksPorts {
 		if !activeExits[name] {
+			// Close firewall ports for removed exit
+			if port, ok := meta.ExitVlessPorts[name]; ok {
+				FirewallRemovePort(port, "tcp")
+			}
+			if port, ok := meta.ExitHy2Ports[name]; ok {
+				FirewallRemovePort(port, "udp")
+			}
 			delete(meta.ExitSocksPorts, name)
 			delete(meta.ExitVlessPorts, name)
 			delete(meta.ExitHy2Ports, name)
 			changed = true
+			log.Printf("[reconcile] removed ports for exit %s", name)
 		}
 	}
 	return changed
@@ -622,6 +630,7 @@ func rebuildEntryConfig(currentData []byte, meta *Metadata, transits []TransitIn
 	}
 
 	// --- Extract crypto material from main inbounds (for per-exit reuse) ---
+	// Deep copy via JSON round-trip to avoid shared references across inbounds.
 	var vlessReality map[string]interface{} // TLS+Reality config from vless-in
 	var hy2TLS map[string]interface{}       // TLS config from hy2-in
 	var hy2Obfs map[string]interface{}      // obfs config from hy2-in
@@ -634,14 +643,14 @@ func rebuildEntryConfig(currentData []byte, meta *Metadata, transits []TransitIn
 			switch ibMap["tag"] {
 			case "vless-in":
 				if tls, ok := ibMap["tls"].(map[string]interface{}); ok {
-					vlessReality = tls
+					vlessReality = deepCopyMap(tls)
 				}
 			case "hy2-in":
 				if tls, ok := ibMap["tls"].(map[string]interface{}); ok {
-					hy2TLS = tls
+					hy2TLS = deepCopyMap(tls)
 				}
 				if obfs, ok := ibMap["obfs"].(map[string]interface{}); ok {
-					hy2Obfs = obfs
+					hy2Obfs = deepCopyMap(obfs)
 				}
 			}
 		}
@@ -680,7 +689,7 @@ func rebuildEntryConfig(currentData []byte, meta *Metadata, transits []TransitIn
 				"listen": "::", "listen_port": port,
 				"sniff": true, "sniff_override_destination": true,
 				"users": []interface{}{}, // populated by syncInboundUsers
-				"tls":   vlessReality,
+				"tls":   deepCopyMap(vlessReality),
 			})
 		}
 		// Hysteria2 (user-facing, for manual exit selection)
@@ -691,10 +700,10 @@ func rebuildEntryConfig(currentData []byte, meta *Metadata, transits []TransitIn
 				"sniff": true, "sniff_override_destination": true,
 				"users":                   []interface{}{}, // populated by syncInboundUsers
 				"ignore_client_bandwidth": true,
-				"tls":                     hy2TLS,
+				"tls":                     deepCopyMap(hy2TLS),
 			}
 			if hy2Obfs != nil {
-				hy2Inbound["obfs"] = hy2Obfs
+				hy2Inbound["obfs"] = deepCopyMap(hy2Obfs)
 			}
 			mainInbounds = append(mainInbounds, hy2Inbound)
 		}
@@ -744,6 +753,19 @@ func rebuildEntryConfig(currentData []byte, meta *Metadata, transits []TransitIn
 // =============================================================================
 // Shared helpers
 // =============================================================================
+
+// deepCopyMap makes an independent copy of a map via JSON round-trip.
+func deepCopyMap(m map[string]interface{}) map[string]interface{} {
+	data, err := json.Marshal(m)
+	if err != nil {
+		return m
+	}
+	var cp map[string]interface{}
+	if err := json.Unmarshal(data, &cp); err != nil {
+		return m
+	}
+	return cp
+}
 
 func validateAndApplyConfig(newData []byte, logPrefix string) error {
 	tmpFile := ConfigPath() + ".tmp"
