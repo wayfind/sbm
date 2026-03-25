@@ -476,25 +476,38 @@ function submitAddUser() {
   var name = document.getElementById('new-user-name').value.trim();
   if (!name) { alert('请输入用户名'); return; }
   var quota = parseFloat(document.getElementById('new-user-quota').value) || 0;
-  apiCall('POST', '/api/users', { name: name, quota_gb: quota }).then(function(r) {
+  // Generate UUID and password client-side
+  var uuid = crypto.randomUUID();
+  var pwBytes = new Uint8Array(12);
+  crypto.getRandomValues(pwBytes);
+  var password = btoa(String.fromCharCode.apply(null, pwBytes)).replace(/[+/=]/g, function(c) {
+    return c === '+' ? 'A' : c === '/' ? 'B' : '';
+  }).slice(0, 16);
+  // Push to CF registry (source of truth) — entry nodes will sync automatically
+  apiCall('PUT', '/api/cf-users/' + name, { uuid: uuid, password: password, quota_gb: quota }).then(function(r) {
     if (r.error) { alert('错误: ' + r.error); return; }
     closeModal();
+    alert('用户 ' + name + ' 已创建，各 entry 节点将在 5 分钟内自动同步');
     loadUsers();
   });
 }
 
 function deleteUser(name) {
-  if (!confirm('确认删除用户 ' + name + '？')) return;
-  apiCall('DELETE', '/api/users/' + name).then(function() { loadUsers(); });
+  if (!confirm('确认删除用户 ' + name + '？\\n各 entry 节点将在 5 分钟内自动清理')) return;
+  apiCall('DELETE', '/api/cf-users/' + name).then(function() { loadUsers(); });
 }
 
 function editQuota(name, currentQuota) {
   var q = prompt('设置月配额 (GB，0=无限)', currentQuota);
   if (q === null) return;
-  apiCall('PUT', '/api/users/' + name, { quota_gb: parseFloat(q) || 0 }).then(function() { loadUsers(); });
+  // Update CF registry — entry nodes will sync automatically
+  apiCall('PUT', '/api/cf-users/' + name, { quota_gb: parseFloat(q) || 0 }).then(function() {
+    loadUsers();
+  });
 }
 
 function toggleUser(name, currentEnabled) {
+  // enabled is per-entry local state, proxy to entry node
   apiCall('PUT', '/api/users/' + name, { enabled: !currentEnabled }).then(function() { loadUsers(); });
 }
 
@@ -693,6 +706,51 @@ export default {
     if (request.method === 'DELETE' && path.startsWith('/nodes/')) {
       const id = path.slice(7);
       await env.TOPO_KV.delete(id);
+      return Response.json({ status: 'ok' });
+    }
+
+    // --- CF User registry (source of truth) ---
+
+    // GET /api/cf-users — list all users
+    if (request.method === 'GET' && path === '/api/cf-users') {
+      const list = await env.TOPO_KV.list({ prefix: 'user/' });
+      const users = [];
+      for (const key of list.keys) {
+        const val = await env.TOPO_KV.get(key.name);
+        if (val) {
+          try {
+            const u = JSON.parse(val);
+            u.name = key.name.slice(5); // strip "user/" prefix
+            users.push(u);
+          } catch {}
+        }
+      }
+      return Response.json(users);
+    }
+
+    // PUT /api/cf-users/:name — create or update user
+    if (request.method === 'PUT' && path.startsWith('/api/cf-users/')) {
+      const name = path.slice(14);
+      if (!name) return Response.json({ error: 'missing name' }, { status: 400 });
+      const body = await request.json().catch(() => null);
+      if (!body) return Response.json({ error: 'invalid json' }, { status: 400 });
+      // Merge with existing (preserve fields not in request)
+      const existing = await env.TOPO_KV.get('user/' + name);
+      let merged = existing ? JSON.parse(existing) : {};
+      if (body.uuid) merged.uuid = body.uuid;
+      if (body.password) merged.password = body.password;
+      if (body.quota_gb !== undefined) merged.quota_gb = body.quota_gb;
+      if (!merged.created_at) merged.created_at = new Date().toISOString();
+      await env.TOPO_KV.put('user/' + name, JSON.stringify(merged));
+      merged.name = name;
+      return Response.json(merged);
+    }
+
+    // DELETE /api/cf-users/:name — delete user
+    if (request.method === 'DELETE' && path.startsWith('/api/cf-users/')) {
+      const name = path.slice(14);
+      if (!name) return Response.json({ error: 'missing name' }, { status: 400 });
+      await env.TOPO_KV.delete('user/' + name);
       return Response.json({ status: 'ok' });
     }
 

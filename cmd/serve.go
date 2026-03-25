@@ -51,13 +51,6 @@ func RunServe(args []string) error {
 		}
 	}
 
-	// Migrate legacy node-level credentials to named user (entry only, idempotent)
-	if usersDB != nil {
-		if err := internal.EnsureDefaultUser(usersDB, meta); err != nil {
-			log.Printf("[users] default user migration: %v", err)
-		}
-	}
-
 	mux := http.NewServeMux()
 
 	// Initialize CF topology client (if configured)
@@ -65,6 +58,13 @@ func RunServe(args []string) error {
 	if meta.CFWorkerURL != "" && meta.CFAPIKey != "" {
 		cfClient = internal.NewCFTopoClient(meta.CFWorkerURL, meta.CFAPIKey)
 		log.Printf("[cf] topology client initialized: %s", meta.CFWorkerURL)
+	}
+
+	// Sync users from CF on startup (entry only, blocking)
+	if meta.Role == internal.RoleEntry && usersDB != nil && cfClient != nil {
+		if err := internal.SyncUsersFromCF(usersDB, cfClient); err != nil {
+			log.Printf("[user-sync] initial sync error (continuing with local data): %v", err)
+		}
 	}
 
 	// Subscription endpoint (all users including hz-office go through per-user path)
@@ -101,6 +101,11 @@ func RunServe(args []string) error {
 				log.Printf("[traffic] reconcile after quota disable failed: %v", err)
 			}
 		})
+	}
+
+	// User sync from CF (entry only, periodic)
+	if meta.Role == internal.RoleEntry && usersDB != nil {
+		internal.StartUserSyncLoop(usersDB, cfClient, 5*time.Minute)
 	}
 
 	// BWG bandwidth balancing (entry only)
@@ -265,7 +270,7 @@ func makeAPIUsersRouter(db *sql.DB, meta *internal.Metadata, cfClient *internal.
 			}
 			internal.PrintJSONTo(w, resp)
 
-		// POST /api/users — add user
+		// POST /api/users — add user (push to CF first, then local)
 		case r.Method == "POST" && name == "":
 			var req struct {
 				Name    string  `json:"name"`
@@ -284,16 +289,18 @@ func makeAPIUsersRouter(db *sql.DB, meta *internal.Metadata, cfClient *internal.
 				jsonError(w, err.Error(), 400)
 				return
 			}
+			// Push to CF (best-effort: don't fail if CF is down)
+			if cfClient != nil {
+				if err := internal.PushUserToCF(db, cfClient, req.Name); err != nil {
+					log.Printf("[user-sync] push %s to CF error: %v", req.Name, err)
+				}
+			}
 			w.WriteHeader(201)
 			internal.PrintJSONTo(w, user)
 
-		// DELETE /api/users/<name> — delete user
+		// DELETE /api/users/<name> — only allowed via CF Dashboard
 		case r.Method == "DELETE" && name != "":
-			if err := internal.DelUser(db, name); err != nil {
-				jsonError(w, err.Error(), 400)
-				return
-			}
-			internal.PrintJSONTo(w, map[string]string{"status": "ok"})
+			jsonError(w, "请从 CF Dashboard 删除用户 (https://tun.vspeak.top/dashboard)", 403)
 
 		// PUT /api/users/<name> — update user (quota_gb, enabled)
 		case r.Method == "PUT" && name != "" && action == "":
