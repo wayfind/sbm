@@ -2,6 +2,7 @@ package internal
 
 import (
 	"fmt"
+	"sort"
 )
 
 // EntryParams holds parameters for generating entry node configuration.
@@ -275,14 +276,35 @@ func buildExitOutbound(tag string, e *ExitInfo) map[string]interface{} {
 
 // BuildEntryOutbounds builds the outbounds section for an entry node config.
 // Used by both GenerateEntryConfig (initial install) and reconcile (auto-update).
+// Transit outbounds are sorted with hy2 first for protocol preference in urltest.
 func BuildEntryOutbounds(transits []TransitInfo, exits []ExitInfo) []interface{} {
 	outbounds := []interface{}{}
-	transitTags := []string{}
 
-	for _, t := range transits {
-		tag := "transit-" + t.Name
-		transitTags = append(transitTags, tag)
-		outbounds = append(outbounds, BuildProxyOutbound(tag, &t))
+	// Sort transits: hy2 first (urltest prefers first within tolerance)
+	type transitWithTag struct {
+		tag   string
+		info  TransitInfo
+		isHy2 bool
+	}
+	sorted := make([]transitWithTag, len(transits))
+	for i, t := range transits {
+		sorted[i] = transitWithTag{
+			tag:   "transit-" + t.Name,
+			info:  t,
+			isHy2: t.Protocol == "hysteria2",
+		}
+	}
+	sort.SliceStable(sorted, func(i, j int) bool {
+		if sorted[i].isHy2 != sorted[j].isHy2 {
+			return sorted[i].isHy2 // hy2 first
+		}
+		return false // preserve original order within same protocol
+	})
+
+	transitTags := make([]string, len(sorted))
+	for i, s := range sorted {
+		transitTags[i] = s.tag
+		outbounds = append(outbounds, BuildProxyOutbound(s.tag, &s.info))
 	}
 
 	outbounds = append(outbounds, map[string]interface{}{

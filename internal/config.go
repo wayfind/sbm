@@ -89,6 +89,8 @@ type Metadata struct {
 	ExitPorts      map[string]int    `json:"exit_ports,omitempty"`       // transit: exit_name → per-exit inbound port
 	ExitAuth       map[string]string `json:"exit_auth,omitempty"`        // transit: exit_name → per-exit socks auth password
 	ExitSocksPorts map[string]int    `json:"exit_socks_ports,omitempty"` // entry: exit_name → localhost socks5 port
+	ExitVlessPorts map[string]int    `json:"exit_vless_ports,omitempty"` // entry: exit_name → per-exit vless inbound port
+	ExitHy2Ports   map[string]int    `json:"exit_hy2_ports,omitempty"`   // entry: exit_name → per-exit hy2 inbound port
 
 	// Transient field: Reality private key recovered from old config (not serialized)
 	PrivateKey string `json:"-"`

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -136,7 +137,7 @@ func ReconcileEntryConfig(meta *Metadata, downstreams []TopologyTree, db *sql.DB
 	}
 
 	// Assign per-exit SOCKS5 ports (localhost, for application-layer routing)
-	portsChanged := assignExitSocksPorts(meta, desiredExits)
+	portsChanged := assignExitPorts(meta, desiredExits)
 
 	ConfigMu.Lock()
 	defer ConfigMu.Unlock()
@@ -163,6 +164,17 @@ func ReconcileEntryConfig(meta *Metadata, downstreams []TopologyTree, db *sql.DB
 		if err := meta.Save(); err != nil {
 			log.Printf("[reconcile] save metadata error: %v", err)
 		}
+		// Open firewall for new per-exit user-facing ports
+		for name, port := range meta.ExitVlessPorts {
+			if err := FirewallAddPort(port, "tcp"); err != nil {
+				log.Printf("[reconcile] firewall vless port %d for %s: %v", port, name, err)
+			}
+		}
+		for name, port := range meta.ExitHy2Ports {
+			if err := FirewallAddPort(port, "udp"); err != nil {
+				log.Printf("[reconcile] firewall hy2 port %d for %s: %v", port, name, err)
+			}
+		}
 	}
 
 	return validateAndApplyConfig(newData, "[reconcile-entry]")
@@ -183,7 +195,9 @@ func topoToTransits(downstreams []TopologyTree) []TransitInfo {
 			result = append(result, *ti)
 		}
 	}
-	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
+	// No sort — ordering is handled by BuildEntryOutbounds (hy2 preference)
+	// and failover rebalance (bandwidth-based). Alphabetical sort would
+	// override failover's bandwidth balancing on every reconcile cycle.
 	return result
 }
 
@@ -271,9 +285,15 @@ func pickBestInbound(node NodeInfo) *TransitInfo {
 // Per-exit SOCKS5 port management (Entry localhost, for application routing)
 // =============================================================================
 
-func assignExitSocksPorts(meta *Metadata, exits []ExitInfo) bool {
+func assignExitPorts(meta *Metadata, exits []ExitInfo) bool {
 	if meta.ExitSocksPorts == nil {
 		meta.ExitSocksPorts = make(map[string]int)
+	}
+	if meta.ExitVlessPorts == nil {
+		meta.ExitVlessPorts = make(map[string]int)
+	}
+	if meta.ExitHy2Ports == nil {
+		meta.ExitHy2Ports = make(map[string]int)
 	}
 	changed := false
 	for _, e := range exits {
@@ -283,6 +303,18 @@ func assignExitSocksPorts(meta *Metadata, exits []ExitInfo) bool {
 			changed = true
 			log.Printf("[reconcile] assigned socks5 port %d for exit %s", port, e.Name)
 		}
+		if _, exists := meta.ExitVlessPorts[e.Name]; !exists {
+			port := AllocatePort(20100, 20300, meta.ExitVlessPorts)
+			meta.ExitVlessPorts[e.Name] = port
+			changed = true
+			log.Printf("[reconcile] assigned vless port %d for exit %s", port, e.Name)
+		}
+		if _, exists := meta.ExitHy2Ports[e.Name]; !exists {
+			port := AllocatePort(20300, 20500, meta.ExitHy2Ports)
+			meta.ExitHy2Ports[e.Name] = port
+			changed = true
+			log.Printf("[reconcile] assigned hy2 port %d for exit %s", port, e.Name)
+		}
 	}
 	activeExits := map[string]bool{}
 	for _, e := range exits {
@@ -291,6 +323,8 @@ func assignExitSocksPorts(meta *Metadata, exits []ExitInfo) bool {
 	for name := range meta.ExitSocksPorts {
 		if !activeExits[name] {
 			delete(meta.ExitSocksPorts, name)
+			delete(meta.ExitVlessPorts, name)
+			delete(meta.ExitHy2Ports, name)
 			changed = true
 		}
 	}
@@ -307,25 +341,29 @@ func entryConfigNeedsUpdate(configData []byte, transits []TransitInfo, exits []E
 		return true
 	}
 
-	// Compare desired outbounds JSON against current (catches address/port/password changes)
+	// Compare outbounds: tag→JSON map (ignores urltest internal order for failover compat)
 	desiredOutbounds := BuildEntryOutbounds(transits, exits)
-	desiredJSON, err := json.Marshal(desiredOutbounds)
-	if err != nil {
-		return true
-	}
-	currentOutbounds, ok := config["outbounds"]
+	desiredByTag := outboundsByTag(desiredOutbounds)
+	currentOutboundsList, ok := config["outbounds"].([]interface{})
 	if !ok {
 		return true
 	}
-	currentJSON, err := json.Marshal(currentOutbounds)
-	if err != nil {
+	currentByTag := outboundsByTag(currentOutboundsList)
+
+	if len(desiredByTag) != len(currentByTag) {
 		return true
 	}
-	if string(desiredJSON) != string(currentJSON) {
-		return true
+	for tag, desiredJSON := range desiredByTag {
+		currentJSON, ok := currentByTag[tag]
+		if !ok {
+			return true
+		}
+		if desiredJSON != currentJSON {
+			return true
+		}
 	}
 
-	// Check per-exit inbound count
+	// Check per-exit inbound count (each exit → socks + vless + hy2 = 3 inbounds)
 	currentExitInbounds := 0
 	if inbounds, ok := config["inbounds"].([]interface{}); ok {
 		for _, ib := range inbounds {
@@ -334,16 +372,60 @@ func entryConfigNeedsUpdate(configData []byte, transits []TransitInfo, exits []E
 				continue
 			}
 			tag, _ := ibMap["tag"].(string)
-			if len(tag) > 11 && tag[:11] == "socks-exit-" {
+			if isPerExitTag(tag) {
 				currentExitInbounds++
 			}
 		}
 	}
-	if currentExitInbounds != len(exits) {
+	if currentExitInbounds != len(exits)*3 {
 		return true
 	}
 
 	return false
+}
+
+// outboundsByTag extracts tag→JSON map from outbounds list.
+// For urltest/selector, the "outbounds" array is sorted before serialization
+// to make comparison order-independent (preserves failover rebalance).
+func outboundsByTag(outbounds []interface{}) map[string]string {
+	result := make(map[string]string)
+	for _, ob := range outbounds {
+		obMap, ok := ob.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		tag, _ := obMap["tag"].(string)
+		if tag == "" {
+			continue
+		}
+		// For urltest/selector: sort inner outbounds array for order-independent comparison
+		typ, _ := obMap["type"].(string)
+		if typ == "urltest" || typ == "selector" {
+			if inner, ok := obMap["outbounds"].([]interface{}); ok {
+				sorted := make([]string, 0, len(inner))
+				for _, v := range inner {
+					if s, ok := v.(string); ok {
+						sorted = append(sorted, s)
+					}
+				}
+				sort.Strings(sorted)
+				sortedIface := make([]interface{}, len(sorted))
+				for i, s := range sorted {
+					sortedIface[i] = s
+				}
+				// Copy map to avoid mutating original
+				cp := make(map[string]interface{})
+				for k, v := range obMap {
+					cp[k] = v
+				}
+				cp["outbounds"] = sortedIface
+				obMap = cp
+			}
+		}
+		j, _ := json.Marshal(obMap)
+		result[tag] = string(j)
+	}
+	return result
 }
 
 // =============================================================================
@@ -428,7 +510,15 @@ func extractInboundUserNames(config map[string]interface{}) map[string]bool {
 	return names
 }
 
-// syncInboundUsers replaces the users arrays in vless-in and hy2-in inbounds.
+// isPerExitTag returns true for per-exit inbound tags (socks-exit-*, vless-exit-*, hy2-exit-*).
+func isPerExitTag(tag string) bool {
+	return strings.HasPrefix(tag, "socks-exit-") ||
+		strings.HasPrefix(tag, "vless-exit-") ||
+		strings.HasPrefix(tag, "hy2-exit-")
+}
+
+// syncInboundUsers replaces the users arrays in all vless and hy2 inbounds
+// (main + per-exit).
 func syncInboundUsers(inbounds []interface{}, users []User) []interface{} {
 	if len(users) == 0 {
 		return inbounds // don't clear users if list is empty (safety)
@@ -451,11 +541,13 @@ func syncInboundUsers(inbounds []interface{}, users []User) []interface{} {
 			continue
 		}
 		tag, _ := ibMap["tag"].(string)
-		switch tag {
-		case "vless-in":
+		typ, _ := ibMap["type"].(string)
+		// Match main inbounds (vless-in, hy2-in) and per-exit (vless-exit-*, hy2-exit-*)
+		switch {
+		case typ == "vless" && (tag == "vless-in" || strings.HasPrefix(tag, "vless-exit-")):
 			ibMap["users"] = vlessUsers
 			inbounds[i] = ibMap
-		case "hy2-in":
+		case typ == "hysteria2" && (tag == "hy2-in" || strings.HasPrefix(tag, "hy2-exit-")):
 			ibMap["users"] = hy2Users
 			inbounds[i] = ibMap
 		}
@@ -529,7 +621,33 @@ func rebuildEntryConfig(currentData []byte, meta *Metadata, transits []TransitIn
 		return nil, err
 	}
 
-	// --- Inbounds: preserve main, replace per-exit SOCKS5 ---
+	// --- Extract crypto material from main inbounds (for per-exit reuse) ---
+	var vlessReality map[string]interface{} // TLS+Reality config from vless-in
+	var hy2TLS map[string]interface{}       // TLS config from hy2-in
+	var hy2Obfs map[string]interface{}      // obfs config from hy2-in
+	if existingIBs, ok := config["inbounds"].([]interface{}); ok {
+		for _, ib := range existingIBs {
+			ibMap, ok := ib.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			switch ibMap["tag"] {
+			case "vless-in":
+				if tls, ok := ibMap["tls"].(map[string]interface{}); ok {
+					vlessReality = tls
+				}
+			case "hy2-in":
+				if tls, ok := ibMap["tls"].(map[string]interface{}); ok {
+					hy2TLS = tls
+				}
+				if obfs, ok := ibMap["obfs"].(map[string]interface{}); ok {
+					hy2Obfs = obfs
+				}
+			}
+		}
+	}
+
+	// --- Inbounds: preserve main, replace per-exit (socks + vless + hy2) ---
 	var mainInbounds []interface{}
 	if existingIBs, ok := config["inbounds"].([]interface{}); ok {
 		for _, ib := range existingIBs {
@@ -538,23 +656,48 @@ func rebuildEntryConfig(currentData []byte, meta *Metadata, transits []TransitIn
 				continue
 			}
 			tag, _ := ibMap["tag"].(string)
-			if len(tag) > 11 && tag[:11] == "socks-exit-" {
+			// Strip all per-exit inbounds (socks-exit-*, vless-exit-*, hy2-exit-*)
+			if isPerExitTag(tag) {
 				continue
 			}
 			mainInbounds = append(mainInbounds, ib)
 		}
 	}
+
+	// Add per-exit inbounds for each exit
 	for _, e := range exits {
-		port, ok := meta.ExitSocksPorts[e.Name]
-		if !ok {
-			continue
+		// SOCKS5 (localhost, for application routing)
+		if port, ok := meta.ExitSocksPorts[e.Name]; ok {
+			mainInbounds = append(mainInbounds, map[string]interface{}{
+				"type": "socks", "tag": "socks-exit-" + e.Name,
+				"listen": "127.0.0.1", "listen_port": port,
+			})
 		}
-		mainInbounds = append(mainInbounds, map[string]interface{}{
-			"type":        "socks",
-			"tag":         "socks-exit-" + e.Name,
-			"listen":      "127.0.0.1",
-			"listen_port": port,
-		})
+		// VLESS Reality (user-facing, for manual exit selection)
+		if port, ok := meta.ExitVlessPorts[e.Name]; ok && vlessReality != nil {
+			mainInbounds = append(mainInbounds, map[string]interface{}{
+				"type": "vless", "tag": "vless-exit-" + e.Name,
+				"listen": "::", "listen_port": port,
+				"sniff": true, "sniff_override_destination": true,
+				"users": []interface{}{}, // populated by syncInboundUsers
+				"tls":   vlessReality,
+			})
+		}
+		// Hysteria2 (user-facing, for manual exit selection)
+		if port, ok := meta.ExitHy2Ports[e.Name]; ok && hy2TLS != nil {
+			hy2Inbound := map[string]interface{}{
+				"type": "hysteria2", "tag": "hy2-exit-" + e.Name,
+				"listen": "::", "listen_port": port,
+				"sniff": true, "sniff_override_destination": true,
+				"users":                   []interface{}{}, // populated by syncInboundUsers
+				"ignore_client_bandwidth": true,
+				"tls":                     hy2TLS,
+			}
+			if hy2Obfs != nil {
+				hy2Inbound["obfs"] = hy2Obfs
+			}
+			mainInbounds = append(mainInbounds, hy2Inbound)
+		}
 	}
 	config["inbounds"] = mainInbounds
 
@@ -577,7 +720,7 @@ func rebuildEntryConfig(currentData []byte, meta *Metadata, transits []TransitIn
 	var perExitRules []interface{}
 	for _, e := range exits {
 		perExitRules = append(perExitRules, map[string]interface{}{
-			"inbound":  []string{"socks-exit-" + e.Name},
+			"inbound":  []string{"socks-exit-" + e.Name, "vless-exit-" + e.Name, "hy2-exit-" + e.Name},
 			"action":   "route",
 			"outbound": "exit-" + e.Name,
 		})
