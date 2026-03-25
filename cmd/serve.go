@@ -60,6 +60,13 @@ func RunServe(args []string) error {
 
 	mux := http.NewServeMux()
 
+	// Initialize CF topology client (if configured)
+	var cfClient *internal.CFTopoClient
+	if meta.CFWorkerURL != "" && meta.CFAPIKey != "" {
+		cfClient = internal.NewCFTopoClient(meta.CFWorkerURL, meta.CFAPIKey)
+		log.Printf("[cf] topology client initialized: %s", meta.CFWorkerURL)
+	}
+
 	// Subscription endpoint (all users including hz-office go through per-user path)
 	mux.HandleFunc("/sub/", makeUserSubHandler(usersDB))
 
@@ -71,16 +78,9 @@ func RunServe(args []string) error {
 	// Dashboard + API (entry only)
 	if meta.Role == internal.RoleEntry && usersDB != nil {
 		mux.HandleFunc("/dashboard", internal.BearerAuth(meta.APIToken, handleDashboard))
-		mux.HandleFunc("/api/users/", internal.BearerAuth(meta.APIToken, makeAPIUsersRouter(usersDB, meta)))
-		mux.HandleFunc("/api/users", internal.BearerAuth(meta.APIToken, makeAPIUsersRouter(usersDB, meta)))
+		mux.HandleFunc("/api/users/", internal.BearerAuth(meta.APIToken, makeAPIUsersRouter(usersDB, meta, cfClient)))
+		mux.HandleFunc("/api/users", internal.BearerAuth(meta.APIToken, makeAPIUsersRouter(usersDB, meta, cfClient)))
 		mux.HandleFunc("/api/config/rules", internal.BearerAuth(meta.APIToken, handleConfigRules))
-	}
-
-	// Initialize CF topology client (if configured)
-	var cfClient *internal.CFTopoClient
-	if meta.CFWorkerURL != "" && meta.CFAPIKey != "" {
-		cfClient = internal.NewCFTopoClient(meta.CFWorkerURL, meta.CFAPIKey)
-		log.Printf("[cf] topology client initialized: %s", meta.CFWorkerURL)
 	}
 
 	// Start topology reporter (dual channel: CF + chain)
@@ -207,12 +207,32 @@ func makeUserSubHandler(db *sql.DB) http.HandlerFunc {
 }
 
 // makeAPIUsersRouter returns a handler that routes /api/users requests by method and subpath.
-func makeAPIUsersRouter(db *sql.DB, meta *internal.Metadata) http.HandlerFunc {
-	subPort := meta.SubPort
-	if subPort == 0 {
-		subPort = 20033
+func makeAPIUsersRouter(db *sql.DB, meta *internal.Metadata, cfClient *internal.CFTopoClient) http.HandlerFunc {
+	// Build subscription URL bases for all entry nodes (self + others from CF KV)
+	buildSubURLs := func(username string) []string {
+		selfPort := meta.SubPort
+		if selfPort == 0 {
+			selfPort = 20033
+		}
+		urls := []string{fmt.Sprintf("https://%s:%d/sub/%s", meta.Domain, selfPort, username)}
+
+		if cfClient != nil {
+			nodes, err := cfClient.GetAllNodes()
+			if err == nil {
+				for _, n := range nodes {
+					if n.Role != internal.RoleEntry || n.NodeID == meta.NodeID || n.Domain == "" {
+						continue
+					}
+					port := n.SubPort
+					if port == 0 {
+						port = 20033
+					}
+					urls = append(urls, fmt.Sprintf("https://%s:%d/sub/%s", n.Domain, port, username))
+				}
+			}
+		}
+		return urls
 	}
-	subBase := fmt.Sprintf("https://%s:%d/sub/", meta.Domain, subPort)
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -235,14 +255,13 @@ func makeAPIUsersRouter(db *sql.DB, meta *internal.Metadata) http.HandlerFunc {
 				jsonError(w, err.Error(), 500)
 				return
 			}
-			// Inject sub_url for each user
 			type userResponse struct {
 				internal.UserWithTraffic
-				SubURL string `json:"sub_url"`
+				SubURLs []string `json:"sub_urls"`
 			}
 			resp := make([]userResponse, len(users))
 			for i, u := range users {
-				resp[i] = userResponse{u, subBase + u.Name}
+				resp[i] = userResponse{u, buildSubURLs(u.Name)}
 			}
 			internal.PrintJSONTo(w, resp)
 
@@ -349,7 +368,7 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 const dashboardHTML = `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>sbm Dashboard</title>
 <style>
-body{font-family:system-ui;max-width:800px;margin:40px auto;padding:0 20px;background:#1a1a2e;color:#eee}
+body{font-family:system-ui;max-width:900px;margin:40px auto;padding:0 20px;background:#1a1a2e;color:#eee}
 h1{color:#e94560}
 table{width:100%;border-collapse:collapse;margin-top:20px}
 th,td{padding:8px 12px;text-align:left;border-bottom:1px solid #333}
@@ -359,11 +378,19 @@ th{color:#e94560}
 .bar{background:#333;border-radius:4px;height:20px;position:relative}
 .bar-fill{background:#e94560;height:100%;border-radius:4px;transition:width 0.3s}
 .bar-text{position:absolute;top:0;left:8px;line-height:20px;font-size:12px}
+.expand{cursor:pointer;user-select:none}
+.expand:hover{color:#e94560}
+.sub-row td{padding:4px 12px 4px 32px;border-bottom:1px solid #222;font-size:13px}
+.sub-url{color:#8be;word-break:break-all;cursor:pointer}
+.sub-url:hover{text-decoration:underline}
+.copied{color:#0f3;font-size:11px;margin-left:8px;opacity:0;transition:opacity 0.3s}
 </style></head><body>
 <h1>sbm Dashboard</h1>
-<table id="users"><thead><tr><th>用户</th><th>状态</th><th>用量</th><th>限额</th><th>进度</th></tr></thead><tbody></tbody></table>
+<table id="users"><thead><tr><th></th><th>用户</th><th>状态</th><th>用量</th><th>限额</th><th>进度</th></tr></thead><tbody></tbody></table>
 <script>
 function formatBytes(b){if(b>=1e12)return(b/1e12).toFixed(1)+' TB';if(b>=1e9)return(b/1e9).toFixed(1)+' GB';if(b>=1e6)return(b/1e6).toFixed(1)+' MB';return(b/1e3).toFixed(0)+' KB'}
+function copyText(el,text){navigator.clipboard.writeText(text);const s=el.nextElementSibling;if(s){s.style.opacity='1';setTimeout(()=>s.style.opacity='0',1500)}}
+let expanded={};
 async function load(){
   const token=new URLSearchParams(location.search).get('token')||'';
   const r=await fetch('/api/users',{headers:{'Authorization':'Bearer '+token}});
@@ -372,13 +399,25 @@ async function load(){
   tbody.innerHTML='';
   for(const u of users||[]){
     const pct=u.quota_gb>0?Math.min(100,u.bytes_total/(u.quota_gb*1e9)*100):0;
+    const urls=u.sub_urls||[];
+    const hasUrls=urls.length>0;
+    const isOpen=expanded[u.name];
     const tr=document.createElement('tr');
-    tr.innerHTML='<td>'+u.name+'</td>'
+    tr.innerHTML='<td class="expand"'+(hasUrls?' onclick="expanded[\''+u.name+'\']=!expanded[\''+u.name+'\'];load()"':'')+' title="点击展开订阅链接">'+(hasUrls?(isOpen?'▼':'▶'):'')+'</td>'
+      +'<td>'+u.name+'</td>'
       +'<td class="'+(u.enabled?'enabled':'disabled')+'">'+(u.enabled?'启用':'禁用')+'</td>'
       +'<td title="↑ '+formatBytes(u.bytes_up)+' / ↓ '+formatBytes(u.bytes_down)+'">'+formatBytes(u.bytes_total)+'</td>'
       +'<td>'+(u.quota_gb>0?u.quota_gb+' GB':'无限')+'</td>'
       +'<td><div class="bar"><div class="bar-fill" style="width:'+pct+'%"></div><div class="bar-text">'+pct.toFixed(0)+'%</div></div></td>';
     tbody.appendChild(tr);
+    if(isOpen&&hasUrls){
+      for(const url of urls){
+        const sr=document.createElement('tr');
+        sr.className='sub-row';
+        sr.innerHTML='<td></td><td colspan="5"><span class="sub-url" onclick="copyText(this,\''+url+'\')">'+url+'</span><span class="copied">已复制</span></td>';
+        tbody.appendChild(sr);
+      }
+    }
   }
 }
 load();setInterval(load,10000);
