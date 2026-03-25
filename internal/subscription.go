@@ -33,7 +33,7 @@ func GenerateUserSubscription(user *UserWithTraffic) (string, error) {
 			mainVlessSid = inb.ShortID
 			mainVlessSNI = inb.SNI
 			if mainVlessSNI == "" {
-				mainVlessSNI = "www.walmart.com"
+				mainVlessSNI = "cloud.tencent.com" // entry is domestic
 			}
 			uris = append(uris, buildVlessURI(user.UUID, addr, inb.Port,
 				mainVlessPbk, mainVlessSid, mainVlessSNI, user.Name+"-vless"))

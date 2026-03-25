@@ -49,7 +49,7 @@ func RunInstall(args []string) error {
 	fs.IntVar(&f.VlessPort, "vless-port", 0, "VLESS 端口 (默认随机)")
 	fs.IntVar(&f.Hy2Port, "hy2-port", 0, "Hysteria2 端口 (默认随机)")
 	fs.IntVar(&f.SubPort, "sub-port", 20033, "订阅服务端口")
-	fs.StringVar(&f.SNI, "sni", "", "VLESS Reality SNI (默认 www.walmart.com, 国内建议 cloud.tencent.com)")
+	fs.StringVar(&f.SNI, "sni", "", "VLESS Reality SNI (entry 默认 cloud.tencent.com, transit 默认 www.walmart.com)")
 	fs.BoolVar(&f.Force, "force", false, "跳过替换确认")
 	fs.StringVar(&f.UpstreamsFile, "upstreams", "", "上游节点配置文件 (entry 必选)")
 	fs.StringVar(&f.CertFile, "cert", "", "TLS 证书文件路径 (替代 ACME)")

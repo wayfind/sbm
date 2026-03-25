@@ -95,7 +95,7 @@ func GenerateEntryConfig(p *EntryParams) (map[string]interface{}, error) {
 	// VLESS Reality inbound (always, no domain needed)
 	realitySNI := p.RealitySNI
 	if realitySNI == "" {
-		realitySNI = "www.walmart.com"
+		realitySNI = "cloud.tencent.com" // entry is domestic, use CN-accessible SNI
 	}
 	inbounds = append(inbounds, map[string]interface{}{
 		"type": "vless", "tag": "vless-in",
