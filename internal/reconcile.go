@@ -78,11 +78,14 @@ func getTopoFromDualView(meta *Metadata, store *TopoStore, cfClient *CFTopoClien
 // cfNodesToDownstreams converts flat CF node list into topology trees for Entry.
 // Every exit is placed under every transit (full-mesh: any transit can reach any exit via detour).
 func cfNodesToDownstreams(nodes []NodeInfo, meta *Metadata) []TopologyTree {
+	now := time.Now()
 	var transitNodes, exitNodes []NodeInfo
 	for _, n := range nodes {
 		if n.NodeID == meta.NodeID {
 			continue
 		}
+		// Recalculate Alive from reported_at — the stored value is always true.
+		n.Alive = now.Sub(n.ReportedAt) <= StaleThreshold
 		switch n.Role {
 		case RoleTransit:
 			transitNodes = append(transitNodes, n)

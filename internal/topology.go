@@ -19,9 +19,8 @@ import (
 // --- Data types ---
 
 type BWGStatus struct {
-	MonthlyBW    int64   `json:"monthly_bw_bytes"`
-	UsedBW       int64   `json:"used_bw_bytes"`
-	RemainingPct float64 `json:"remaining_pct"`
+	DataCounter     int64 `json:"data_counter"`
+	PlanMonthlyData int64 `json:"plan_monthly_data"`
 }
 
 type NodeInfo struct {
@@ -30,6 +29,7 @@ type NodeInfo struct {
 	Role       NodeRole      `json:"role"`
 	Domain     string        `json:"domain,omitempty"`
 	Address    string        `json:"address,omitempty"`
+	SubPort    int           `json:"sub_port,omitempty"`
 	Inbounds   []InboundMeta `json:"inbounds,omitempty"`
 	BWGStatus  *BWGStatus    `json:"bwg_status,omitempty"`
 	Alive      bool          `json:"alive"`
@@ -62,7 +62,7 @@ func (s *TopoStore) Update(tree TopologyTree) {
 }
 
 // StaleThreshold is how long since last report before a node is considered dead.
-const StaleThreshold = 90 * time.Second // debug: ~3 report intervals at 30s
+const StaleThreshold = 15 * time.Minute // ~3 report intervals at 5m
 
 func (s *TopoStore) GetDownstreams() []TopologyTree {
 	s.mu.RLock()
@@ -84,10 +84,46 @@ func (s *TopoStore) Prune() {
 	defer s.mu.Unlock()
 	now := time.Now()
 	for id, t := range s.downstreams {
-		if now.Sub(t.Self.ReportedAt) > 3*time.Minute { // debug: prune after 3min
+		if now.Sub(t.Self.ReportedAt) > time.Hour {
 			delete(s.downstreams, id)
 		}
 	}
+}
+
+// --- BWG status cache ---
+
+var (
+	bwgCacheMu sync.RWMutex
+	bwgCached  *BWGStatus // nil until first successful fetch
+)
+
+// refreshBWGCache fetches BWG data and updates the cache. Non-blocking for callers.
+func refreshBWGCache(cfg *BWGConfig) {
+	svc, err := GetBWGServiceInfo(cfg.VEID, cfg.APIKey)
+	if err != nil {
+		log.Printf("[topology] BWG fetch error: %v", err)
+		return // keep stale cache
+	}
+	monthlyBW := int64(float64(svc.PlanMonthlyData) * svc.MonthlyDataMultiplier)
+	if monthlyBW == 0 {
+		monthlyBW = svc.PlanMonthlyData
+	}
+	bwgCacheMu.Lock()
+	bwgCached = &BWGStatus{
+		DataCounter:     svc.DataCounter,
+		PlanMonthlyData: monthlyBW,
+	}
+	bwgCacheMu.Unlock()
+}
+
+func getCachedBWG() *BWGStatus {
+	bwgCacheMu.RLock()
+	defer bwgCacheMu.RUnlock()
+	if bwgCached == nil {
+		return nil
+	}
+	cp := *bwgCached
+	return &cp
 }
 
 // --- Build self NodeInfo from metadata ---
@@ -98,7 +134,9 @@ func BuildNodeInfo(meta *Metadata) NodeInfo {
 		Name:       meta.Name,
 		Role:       meta.Role,
 		Domain:     meta.Domain,
+		SubPort:    meta.SubPort,
 		Inbounds:   meta.Inbounds,
+		BWGStatus:  getCachedBWG(),
 		Alive:      true,
 		ReportedAt: time.Now(),
 	}
@@ -255,7 +293,12 @@ func StartTopologyReporter(meta *Metadata, store *TopoStore, cfClient *CFTopoCli
 }
 
 func doReport(meta *Metadata, store *TopoStore, cfClient *CFTopoClient, chainClient *http.Client) {
-	// Channel A: Cloudflare KV
+	// Refresh BWG cache first (non-blocking: updates cache, tolerates failure)
+	if meta.BWG != nil {
+		refreshBWGCache(meta.BWG)
+	}
+
+	// Channel A: Cloudflare KV (flat NodeInfo)
 	if cfClient != nil {
 		info := BuildNodeInfo(meta)
 		if err := cfClient.ReportNode(info); err != nil {
@@ -263,7 +306,7 @@ func doReport(meta *Metadata, store *TopoStore, cfClient *CFTopoClient, chainCli
 		}
 	}
 
-	// Channel B: Chain /report to upstreams
+	// Channel B: Chain /report to upstreams (full tree)
 	if chainClient != nil && len(meta.Upstreams) > 0 {
 		reportToUpstreams(meta, store, chainClient)
 	}
@@ -327,6 +370,21 @@ func buildReportURL(upstream UpstreamMeta) string {
 	return "https://" + host + "/report"
 }
 
+// bwgRemainingPct returns remaining bandwidth percentage, clamped to [0, 100].
+func bwgRemainingPct(b *BWGStatus) float64 {
+	if b == nil || b.PlanMonthlyData <= 0 {
+		return -1 // unknown
+	}
+	pct := float64(b.PlanMonthlyData-b.DataCounter) / float64(b.PlanMonthlyData) * 100
+	if pct < 0 {
+		return 0
+	}
+	if pct > 100 {
+		return 100
+	}
+	return pct
+}
+
 // --- Print topology tree (for CLI) ---
 
 func PrintTopologyTree(tree *TopologyTree, indent string) {
@@ -346,8 +404,8 @@ func PrintTopologyTree(tree *TopologyTree, indent string) {
 	}
 
 	fmt.Printf("%s[%s] %s (%s) %s", indent, role, name, addr, status)
-	if tree.Self.BWGStatus != nil {
-		fmt.Printf(" bw=%.1f%%", tree.Self.BWGStatus.RemainingPct)
+	if pct := bwgRemainingPct(tree.Self.BWGStatus); pct >= 0 {
+		fmt.Printf(" bw=%.1f%%", pct)
 	}
 	fmt.Println()
 
@@ -385,8 +443,8 @@ func printTopologyNode(tree *TopologyTree, firstPrefix, restPrefix string) {
 	}
 
 	fmt.Printf("%s[%s] %s (%s) %s", firstPrefix, role, name, addr, status)
-	if tree.Self.BWGStatus != nil {
-		fmt.Printf(" bw=%.1f%%", tree.Self.BWGStatus.RemainingPct)
+	if pct := bwgRemainingPct(tree.Self.BWGStatus); pct >= 0 {
+		fmt.Printf(" bw=%.1f%%", pct)
 	}
 	fmt.Println()
 
