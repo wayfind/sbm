@@ -12,7 +12,7 @@ import (
 )
 
 // V2RayStatsAddr is the V2Ray Stats API listen address (matches sing-box experimental.v2ray_api.listen).
-const V2RayStatsAddr = "127.0.0.1:8080"
+const V2RayStatsAddr = "127.0.0.1:8083"
 
 const statsServiceMethod = "/v2ray.core.app.stats.command.StatsService/QueryStats"
 

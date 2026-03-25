@@ -530,6 +530,7 @@ func extractStatsUsers(config map[string]interface{}) []string {
 }
 
 // syncStatsUsers updates experimental.v2ray_api.stats.users in the config.
+// Also removes legacy clash_api if present (migration from pre-v2.4.0).
 func syncStatsUsers(config map[string]interface{}, users []User) {
 	if len(users) == 0 {
 		return
@@ -539,6 +540,7 @@ func syncStatsUsers(config map[string]interface{}, users []User) {
 		exp = map[string]interface{}{}
 		config["experimental"] = exp
 	}
+	delete(exp, "clash_api") // remove legacy clash_api
 	api, ok := exp["v2ray_api"].(map[string]interface{})
 	if !ok {
 		api = map[string]interface{}{"listen": V2RayStatsAddr}
