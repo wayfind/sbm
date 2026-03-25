@@ -389,7 +389,8 @@ func entryConfigNeedsUpdate(configData []byte, transits []TransitInfo, exits []E
 // Inbound user sync — diff detection + rebuild
 // =============================================================================
 
-// inboundUsersNeedUpdate compares current config's inbound user names against desired users.
+// inboundUsersNeedUpdate compares current config's inbound user names and
+// v2ray_api stats.users against desired users.
 func inboundUsersNeedUpdate(configData []byte, desiredUsers []User) bool {
 	if len(desiredUsers) == 0 {
 		return false // all disabled — not a "change", preserve existing
@@ -398,19 +399,38 @@ func inboundUsersNeedUpdate(configData []byte, desiredUsers []User) bool {
 	if err := json.Unmarshal(configData, &config); err != nil {
 		return true
 	}
-	currentNames := extractInboundUserNames(config)
-	if len(currentNames) != len(desiredUsers) {
-		return true
-	}
+
 	desiredNames := map[string]bool{}
 	for _, u := range desiredUsers {
 		desiredNames[u.Name] = true
+	}
+
+	// Check inbound users
+	currentNames := extractInboundUserNames(config)
+	if len(currentNames) != len(desiredUsers) {
+		return true
 	}
 	for n := range currentNames {
 		if !desiredNames[n] {
 			return true
 		}
 	}
+
+	// Check v2ray_api stats.users (use set to handle potential duplicates)
+	statsUsersList := extractStatsUsers(config)
+	statsUsers := map[string]bool{}
+	for _, n := range statsUsersList {
+		statsUsers[n] = true
+	}
+	if len(statsUsers) != len(desiredUsers) {
+		return true
+	}
+	for n := range statsUsers {
+		if !desiredNames[n] {
+			return true
+		}
+	}
+
 	return false
 }
 
@@ -482,6 +502,60 @@ func syncInboundUsers(inbounds []interface{}, users []User) []interface{} {
 	return inbounds
 }
 
+// extractStatsUsers extracts user names from experimental.v2ray_api.stats.users.
+func extractStatsUsers(config map[string]interface{}) []string {
+	exp, ok := config["experimental"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	api, ok := exp["v2ray_api"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	stats, ok := api["stats"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	users, ok := stats["users"].([]interface{})
+	if !ok {
+		return nil
+	}
+	names := make([]string, 0, len(users))
+	for _, u := range users {
+		if s, ok := u.(string); ok {
+			names = append(names, s)
+		}
+	}
+	return names
+}
+
+// syncStatsUsers updates experimental.v2ray_api.stats.users in the config.
+func syncStatsUsers(config map[string]interface{}, users []User) {
+	if len(users) == 0 {
+		return
+	}
+	exp, ok := config["experimental"].(map[string]interface{})
+	if !ok {
+		exp = map[string]interface{}{}
+		config["experimental"] = exp
+	}
+	api, ok := exp["v2ray_api"].(map[string]interface{})
+	if !ok {
+		api = map[string]interface{}{"listen": V2RayStatsAddr}
+		exp["v2ray_api"] = api
+	}
+	stats, ok := api["stats"].(map[string]interface{})
+	if !ok {
+		stats = map[string]interface{}{"enabled": true}
+		api["stats"] = stats
+	}
+	names := make([]interface{}, len(users))
+	for i, u := range users {
+		names[i] = u.Name
+	}
+	stats["users"] = names
+}
+
 // =============================================================================
 // Config rebuild — preserves inbounds, regenerates outbounds + route
 // =============================================================================
@@ -525,6 +599,7 @@ func rebuildEntryConfig(currentData []byte, meta *Metadata, transits []TransitIn
 	if len(users) > 0 {
 		ibs, _ := config["inbounds"].([]interface{})
 		config["inbounds"] = syncInboundUsers(ibs, users)
+		syncStatsUsers(config, users)
 	}
 
 	// --- Outbounds: transit + exit (detour) + urltest groups ---

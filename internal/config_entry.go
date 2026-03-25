@@ -176,8 +176,12 @@ func GenerateEntryConfig(p *EntryParams) (map[string]interface{}, error) {
 			"enabled":    true,
 			"store_rdrc": true,
 		},
-		"clash_api": map[string]interface{}{
-			"external_controller": "127.0.0.1:9090",
+		"v2ray_api": map[string]interface{}{
+			"listen": V2RayStatsAddr,
+			"stats": map[string]interface{}{
+				"enabled": true,
+				"users":   userNames,
+			},
 		},
 	}
 

@@ -2,160 +2,86 @@ package internal
 
 import (
 	"database/sql"
-	"encoding/json"
-	"fmt"
-	"io"
 	"log"
-	"net/http"
 	"sync"
 	"time"
 )
 
-// ClashAPIAddr is the Clash API listen address for traffic monitoring.
-const ClashAPIAddr = "127.0.0.1:9090"
-
-type ClashConnections struct {
-	DownloadTotal int64             `json:"downloadTotal"`
-	UploadTotal   int64             `json:"uploadTotal"`
-	Connections   []ClashConnection `json:"connections"`
+// deltaTracker tracks previous cumulative values to compute deltas.
+type deltaTracker struct {
+	mu   sync.Mutex
+	prev map[string]*V2RayUserTraffic // user → last seen cumulative values
 }
 
-type ClashConnection struct {
-	ID       string        `json:"id"`
-	Upload   int64         `json:"upload"`
-	Download int64         `json:"download"`
-	Metadata ClashMetadata `json:"metadata"`
-	Chains   []string      `json:"chains"`
-}
+var tracker = deltaTracker{prev: make(map[string]*V2RayUserTraffic)}
 
-type ClashMetadata struct {
-	Network     string `json:"network"`
-	Type        string `json:"type"`
-	SrcIP       string `json:"sourceIP"`
-	DstIP       string `json:"destinationIP"`
-	SrcPort     string `json:"sourcePort"`
-	DstPort     string `json:"destinationPort"`
-	Host        string `json:"host"`
-	InboundName string `json:"inboundName"`
-	InboundUser string `json:"inboundUser"`
-}
-
-// connTracker tracks cumulative bytes per connection ID to compute deltas.
-type connTracker struct {
-	mu       sync.Mutex
-	lastSeen map[string]int64
-}
-
-var tracker = connTracker{lastSeen: make(map[string]int64)}
-
-// FetchAndRecordTraffic queries Clash API /connections, aggregates per-user traffic,
-// records deltas to SQLite, and checks quotas.
-func FetchAndRecordTraffic(db *sql.DB, secret string) (disabled []string, err error) {
-	conns, err := fetchConnections(secret)
+// FetchAndRecordTraffic queries V2Ray Stats API for per-user cumulative traffic,
+// computes deltas since last poll, records to SQLite, and checks quotas.
+func FetchAndRecordTraffic(client *StatsClient, db *sql.DB) (disabled []string, err error) {
+	current, err := client.QueryUserTraffic()
 	if err != nil {
 		return nil, err
 	}
 
+	// Compute deltas under lock, then release before SQLite I/O
+	type userDelta struct {
+		name string
+		up   int64
+		down int64
+	}
+	var deltas []userDelta
+
 	tracker.mu.Lock()
-
-	// If no connections at all, sing-box may have restarted — clear state
-	if len(conns.Connections) == 0 {
-		tracker.lastSeen = make(map[string]int64)
-		tracker.mu.Unlock()
-		return CheckQuotas(db)
-	}
-
-	userUp := map[string]int64{}
-	userDown := map[string]int64{}
-	currentIDs := map[string]bool{}
-
-	for _, c := range conns.Connections {
-		user := c.Metadata.InboundUser
-		if user == "" {
+	for user, cur := range current {
+		prev := tracker.prev[user]
+		if prev == nil {
+			tracker.prev[user] = &V2RayUserTraffic{Uplink: cur.Uplink, Downlink: cur.Downlink}
 			continue
 		}
-		currentIDs[c.ID] = true
 
-		total := c.Upload + c.Download
-		prev := tracker.lastSeen[c.ID]
-		delta := total - prev
-		if delta <= 0 {
-			continue
+		deltaUp := cur.Uplink - prev.Uplink
+		deltaDown := cur.Downlink - prev.Downlink
+
+		// Counter reset (sing-box restart) → treat current values as delta
+		if deltaUp < 0 {
+			deltaUp = cur.Uplink
 		}
-		tracker.lastSeen[c.ID] = total
-
-		if c.Upload+c.Download > 0 {
-			upRatio := float64(c.Upload) / float64(c.Upload+c.Download)
-			userUp[user] += int64(float64(delta) * upRatio)
-			userDown[user] += delta - int64(float64(delta)*upRatio)
+		if deltaDown < 0 {
+			deltaDown = cur.Downlink
 		}
-	}
 
-	// Clean up closed connections
-	for id := range tracker.lastSeen {
-		if !currentIDs[id] {
-			delete(tracker.lastSeen, id)
+		tracker.prev[user] = &V2RayUserTraffic{Uplink: cur.Uplink, Downlink: cur.Downlink}
+
+		if deltaUp+deltaDown > 0 {
+			deltas = append(deltas, userDelta{name: user, up: deltaUp, down: deltaDown})
 		}
 	}
-
 	tracker.mu.Unlock()
 
-	// Record to SQLite
-	for user, up := range userUp {
-		down := userDown[user]
-		if up+down > 0 {
-			if err := RecordTraffic(db, user, up, down); err != nil {
-				log.Printf("[traffic] record %s error: %v", user, err)
-			}
+	// Record to SQLite (no lock held)
+	for _, d := range deltas {
+		if err := RecordTraffic(db, d.name, d.up, d.down); err != nil {
+			log.Printf("[traffic] record %s error: %v", d.name, err)
 		}
 	}
 
 	return CheckQuotas(db)
 }
 
-func fetchConnections(secret string) (*ClashConnections, error) {
-	url := fmt.Sprintf("http://%s/connections", ClashAPIAddr)
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-	if secret != "" {
-		req.Header.Set("Authorization", "Bearer "+secret)
-	}
-
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("clash api: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != 200 {
-		preview := string(body)
-		if len(preview) > 100 {
-			preview = preview[:100]
-		}
-		return nil, fmt.Errorf("clash api status %d: %s", resp.StatusCode, preview)
-	}
-
-	var conns ClashConnections
-	if err := json.Unmarshal(body, &conns); err != nil {
-		return nil, fmt.Errorf("clash api parse: %w", err)
-	}
-	return &conns, nil
-}
-
-// StartTrafficCollector runs periodic traffic collection from Clash API.
-func StartTrafficCollector(db *sql.DB, secret string, interval time.Duration, onDisable func([]string)) {
+// StartTrafficCollector runs periodic traffic collection from V2Ray Stats API.
+func StartTrafficCollector(db *sql.DB, interval time.Duration, onDisable func([]string)) {
 	go func() {
 		time.Sleep(10 * time.Second)
 
+		client, err := NewStatsClient("")
+		if err != nil {
+			log.Printf("[traffic] failed to create stats client: %v", err)
+			return
+		}
+		defer client.Close()
+
 		for {
-			disabled, err := FetchAndRecordTraffic(db, secret)
+			disabled, err := FetchAndRecordTraffic(client, db)
 			if err != nil {
 				log.Printf("[traffic] collect error: %v", err)
 			}
@@ -168,5 +94,5 @@ func StartTrafficCollector(db *sql.DB, secret string, interval time.Duration, on
 			time.Sleep(interval)
 		}
 	}()
-	log.Printf("[traffic] collector started, interval=%s", interval)
+	log.Printf("[traffic] collector started (v2ray stats), interval=%s", interval)
 }

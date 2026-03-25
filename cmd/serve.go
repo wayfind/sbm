@@ -90,7 +90,7 @@ func RunServe(args []string) error {
 
 	// Traffic collector + quota enforcement (entry only)
 	if meta.Role == internal.RoleEntry && usersDB != nil {
-		internal.StartTrafficCollector(usersDB, "", 30*time.Second, func(disabled []string) {
+		internal.StartTrafficCollector(usersDB, 30*time.Second, func(disabled []string) {
 			log.Printf("[traffic] quota exceeded, disabling users %v → restarting sing-box", disabled)
 			// Restart sing-box so it drops connections from disabled users
 			// (reconcile will regenerate config with only enabled users on next cycle)
