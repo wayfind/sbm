@@ -665,7 +665,7 @@ func installRenewCron(sbmPath string) error {
 
 // detectPublicIP queries external services to find this machine's public IP.
 func detectPublicIP() string {
-	for _, url := range []string{"https://ifconfig.me", "https://api.ipify.org", "https://icanhazip.com"} {
+	for _, url := range []string{"https://api.ipify.org", "https://ifconfig.me", "https://icanhazip.com"} {
 		client := &http.Client{Timeout: 5 * time.Second}
 		resp, err := client.Get(url)
 		if err != nil {
@@ -677,7 +677,8 @@ func detectPublicIP() string {
 			continue
 		}
 		ip := strings.TrimSpace(string(body))
-		if ip != "" {
+		// Validate: must look like an IP (digits and dots/colons, no HTML)
+		if ip != "" && !strings.Contains(ip, "<") && !strings.Contains(ip, " ") {
 			return ip
 		}
 	}

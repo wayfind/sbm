@@ -138,19 +138,17 @@ info "验证安装..."
 sing-box version || error "sing-box 启动失败"
 sbm version || error "sbm 启动失败"
 
-# --- Firewall setup ---
+# --- Firewall setup (non-fatal, skip if not available) ---
 setup_firewall() {
     case "$OS" in
         almalinux|centos|rhel|rocky|fedora)
-            if ! systemctl is-active --quiet firewalld 2>/dev/null; then
-                info "启动 firewalld..."
-                systemctl enable --now firewalld
+            if systemctl is-active --quiet firewalld 2>/dev/null; then
+                info "firewalld 已运行"
             fi
             ;;
         ubuntu|debian)
-            if ! ufw status 2>/dev/null | grep -q "active"; then
-                info "启用 ufw..."
-                ufw --force enable
+            if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "active"; then
+                info "ufw 已运行"
             fi
             ;;
     esac
