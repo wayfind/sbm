@@ -246,7 +246,11 @@ func pickBestInbound(node NodeInfo) *TransitInfo {
 
 	sni := node.Domain
 	if best.Protocol == "vless" && best.PublicKey != "" {
-		sni = "www.walmart.com"
+		if best.SNI != "" {
+			sni = best.SNI
+		} else {
+			sni = "www.walmart.com"
+		}
 	}
 
 	return &TransitInfo{

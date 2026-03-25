@@ -27,10 +27,14 @@ func GenerateUserSubscription(user *UserWithTraffic) (string, error) {
 		if inb.Protocol == "vless" && inb.ForExit == "" {
 			pbk := inb.PublicKey
 			sid := inb.ShortID
+			sni := inb.SNI
+			if sni == "" {
+				sni = "www.walmart.com"
+			}
 			params := url.Values{
 				"flow": {"xtls-rprx-vision"}, "type": {"tcp"}, "security": {"reality"},
 				"pbk": {pbk}, "sid": {sid},
-				"fp": {"chrome"}, "sni": {"www.walmart.com"},
+				"fp": {"chrome"}, "sni": {sni},
 			}
 			uris = append(uris, fmt.Sprintf("vless://%s@%s:%d?%s#%s",
 				user.UUID, addr, inb.Port, params.Encode(), user.Name+"-vless"))

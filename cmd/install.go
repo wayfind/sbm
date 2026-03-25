@@ -18,6 +18,7 @@ type InstallFlags struct {
 	VlessPort     int
 	Hy2Port       int
 	SubPort       int
+	SNI           string
 	Force         bool
 	UpstreamsFile string
 	CertFile      string
@@ -42,6 +43,7 @@ func RunInstall(args []string) error {
 	fs.IntVar(&f.VlessPort, "vless-port", 0, "VLESS 端口 (默认随机)")
 	fs.IntVar(&f.Hy2Port, "hy2-port", 0, "Hysteria2 端口 (默认随机)")
 	fs.IntVar(&f.SubPort, "sub-port", 20033, "订阅服务端口")
+	fs.StringVar(&f.SNI, "sni", "", "VLESS Reality SNI (默认 www.walmart.com, 国内建议 cloud.tencent.com)")
 	fs.BoolVar(&f.Force, "force", false, "跳过替换确认")
 	fs.StringVar(&f.UpstreamsFile, "upstreams", "", "上游节点配置文件 (entry 必选)")
 	fs.StringVar(&f.CertFile, "cert", "", "TLS 证书文件路径 (替代 ACME)")
@@ -218,7 +220,7 @@ func buildBaseInboundMetas(f *InstallFlags, cm *cryptoMaterials) []internal.Inbo
 	return []internal.InboundMeta{
 		{
 			Tag: "vless-in", Protocol: "vless", Port: f.VlessPort, Transport: "tcp",
-			PublicKey: cm.PublicKey, ShortID: cm.ShortID, UUID: cm.UUID,
+			PublicKey: cm.PublicKey, ShortID: cm.ShortID, UUID: cm.UUID, SNI: f.SNI,
 		},
 		{
 			Tag: "hy2-in", Protocol: "hysteria2", Port: f.Hy2Port, Transport: "udp",
@@ -422,7 +424,7 @@ func installEntryNode(f *InstallFlags) error {
 		Domain: f.Domain, VlessPort: f.VlessPort, Hy2Port: f.Hy2Port,
 		SubPort: f.SubPort, UUID: cm.UUID, PrivateKey: cm.PrivateKey, PublicKey: cm.PublicKey,
 		ShortID: cm.ShortID, Hy2Pass: cm.Hy2Pass, ObfsPass: cm.ObfsPass,
-		CertFile: f.CertFile, KeyFile: f.KeyFile,
+		CertFile: f.CertFile, KeyFile: f.KeyFile, RealitySNI: f.SNI,
 		Transits: upCfg.Transits, Exits: upCfg.Exits,
 		Users: entryUsers,
 	}

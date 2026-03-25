@@ -23,6 +23,7 @@ type EntryParams struct {
 	ShortID    string
 	Hy2Pass    string
 	ObfsPass   string
+	RealitySNI string // TLS SNI for Reality handshake (default: www.walmart.com)
 
 	// SOCKS5 inbound for special routing (e.g., H800 relay)
 	Socks5Port     int      // 0 = no SOCKS5 inbound
@@ -91,6 +92,10 @@ func GenerateEntryConfig(p *EntryParams) (map[string]interface{}, error) {
 	}
 
 	// VLESS Reality inbound (always, no domain needed)
+	realitySNI := p.RealitySNI
+	if realitySNI == "" {
+		realitySNI = "www.walmart.com"
+	}
 	inbounds = append(inbounds, map[string]interface{}{
 		"type": "vless", "tag": "vless-in",
 		"listen": "::", "listen_port": p.VlessPort,
@@ -98,10 +103,10 @@ func GenerateEntryConfig(p *EntryParams) (map[string]interface{}, error) {
 		"users": vlessUsers,
 		"tls": map[string]interface{}{
 			"enabled":     true,
-			"server_name": "www.walmart.com",
+			"server_name": realitySNI,
 			"reality": map[string]interface{}{
 				"enabled":     true,
-				"handshake":   map[string]interface{}{"server": "www.walmart.com", "server_port": 443},
+				"handshake":   map[string]interface{}{"server": realitySNI, "server_port": 443},
 				"private_key": p.PrivateKey,
 				"short_id":    []string{p.ShortID},
 			},

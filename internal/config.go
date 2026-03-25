@@ -46,6 +46,7 @@ type InboundMeta struct {
 	Transport string `json:"transport"`             // tcp, udp
 	PublicKey string `json:"public_key,omitempty"`   // vless reality
 	ShortID   string `json:"short_id,omitempty"`     // vless reality
+	SNI       string `json:"sni,omitempty"`          // vless reality server_name
 	UUID      string `json:"uuid,omitempty"`         // vless
 	Username  string `json:"username,omitempty"`      // socks auth
 	Password  string `json:"password,omitempty"`     // hy2, ss, socks auth
