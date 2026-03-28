@@ -52,6 +52,7 @@ make deploy   # scp 到目标服务器
 |--------|------|---------|
 | shuzuan_gia | 2058893 | `private_MRJQxzmDBj5KEnabUAr7qW76` |
 | yl_gia | 2059033 | `private_pGhH68wwKUTvfsyKGzJCZMQ3` |
+| metask_gia | 2089272 | `private_rZNv77fMDaGxVUWrrzjjcUzU` |
 
 > API 文档: https://api.64clouds.com/v1/
 
