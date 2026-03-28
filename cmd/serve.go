@@ -86,8 +86,8 @@ func RunServe(args []string) error {
 	// Start topology reporter (dual channel: CF + chain)
 	internal.StartTopologyReporter(meta, topoStore, cfClient, 5*time.Minute)
 
-	// Topology-driven auto-config (entry only — transit is pure relay, no reconcile needed)
-	if meta.Role == internal.RoleEntry {
+	// Topology-driven auto-config (entry: transit/exit outbounds, transit: per-exit channels)
+	if meta.Role == internal.RoleEntry || meta.Role == internal.RoleTransit {
 		internal.StartReconcileLoop(meta, topoStore, cfClient, usersDB, 1*time.Minute)
 	}
 
