@@ -19,9 +19,9 @@ type BWGServiceInfo struct {
 	PlanMonthlyData        int64   `json:"plan_monthly_data"`        // bytes per period
 
 	// Instance info
-	Hostname string `json:"hostname"`
-	NodeIP   string `json:"ip_addresses"`
-	VEID     int64  `json:"veid"`
+	Hostname string          `json:"hostname"`
+	NodeIP   json.RawMessage `json:"ip_addresses"` // can be string or array
+	VEID     int64           `json:"veid"`
 
 	// Status
 	VeStatus string `json:"ve_status"` // "running", "stopped", etc.

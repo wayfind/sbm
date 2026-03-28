@@ -109,8 +109,12 @@ func RunServe(args []string) error {
 	}
 
 	// BWG bandwidth balancing (entry only)
+	// Primary: topology-driven (reads BWG status from CF, no failover.json needed)
+	// Fallback: failover.json (manual BWG credentials, for nodes without CF)
 	if meta.Role == internal.RoleEntry {
-		if failoverCfg, err := loadFailoverConfig(); err == nil && len(failoverCfg.Transits) > 0 {
+		if cfClient != nil {
+			internal.StartTopoRebalanceLoop(cfClient, 1*time.Hour)
+		} else if failoverCfg, err := loadFailoverConfig(); err == nil && len(failoverCfg.Transits) > 0 {
 			internal.StartFailoverLoop(failoverCfg, 1*time.Hour)
 		}
 	}

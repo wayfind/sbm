@@ -15,8 +15,8 @@ type FailoverConfig struct {
 }
 
 type FailoverTransit struct {
-	Name   string     `json:"name"`   // matches transit tag suffix
-	BWG    *BWGConfig `json:"bwg"`    // BWG API credentials
+	Name string     `json:"name"` // matches transit tag suffix
+	BWG  *BWGConfig `json:"bwg"`  // BWG API credentials
 }
 
 // TransitBWStatus holds bandwidth status for a single transit.
@@ -98,6 +98,84 @@ func BalancedTransitOrder(statuses []TransitBWStatus) []string {
 	return names
 }
 
+// =============================================================================
+// Shared config rewrite: reorder gia-auto urltest outbound
+// =============================================================================
+
+// reorderGiaAuto updates the gia-auto urltest outbound with the given transit
+// order. Skips restart if the order hasn't changed. Returns nil on no-op.
+func reorderGiaAuto(ordered []string, logPrefix string) error {
+	ConfigMu.Lock()
+	defer ConfigMu.Unlock()
+
+	data, err := os.ReadFile(ConfigPath())
+	if err != nil {
+		return fmt.Errorf("read config: %w", err)
+	}
+
+	var config map[string]interface{}
+	if err := json.Unmarshal(data, &config); err != nil {
+		return fmt.Errorf("parse config: %w", err)
+	}
+
+	outbounds, ok := config["outbounds"].([]interface{})
+	if !ok {
+		return fmt.Errorf("config outbounds not found")
+	}
+
+	// Find gia-auto and check if order actually changed
+	for i, ob := range outbounds {
+		obMap, ok := ob.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if obMap["tag"] != "gia-auto" || obMap["type"] != "urltest" {
+			continue
+		}
+
+		// Compare current order with desired
+		current, _ := obMap["outbounds"].([]interface{})
+		if tagsEqual(current, ordered) {
+			log.Printf("%s order unchanged, skipping restart", logPrefix)
+			return nil
+		}
+
+		tags := make([]interface{}, len(ordered))
+		for j, name := range ordered {
+			tags[j] = "transit-" + name
+		}
+		obMap["outbounds"] = tags
+		outbounds[i] = obMap
+
+		config["outbounds"] = outbounds
+		newData, err := json.MarshalIndent(config, "", "  ")
+		if err != nil {
+			return fmt.Errorf("marshal config: %w", err)
+		}
+		return validateAndApplyConfig(newData, logPrefix)
+	}
+
+	return fmt.Errorf("gia-auto urltest outbound not found in config")
+}
+
+// tagsEqual checks if current outbound tags match the desired transit names.
+func tagsEqual(current []interface{}, desired []string) bool {
+	if len(current) != len(desired) {
+		return false
+	}
+	for i, v := range current {
+		s, ok := v.(string)
+		if !ok || s != "transit-"+desired[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// =============================================================================
+// Failover.json-driven rebalancer (legacy path, for nodes without CF)
+// =============================================================================
+
 // RebalanceEntryConfig reads the current entry config, reorders the urltest outbound
 // group based on transit bandwidth usage, and saves + reloads.
 func RebalanceEntryConfig(failoverCfg *FailoverConfig) error {
@@ -119,65 +197,16 @@ func RebalanceEntryConfig(failoverCfg *FailoverConfig) error {
 	}
 	log.Printf("[failover] balanced order: %v", ordered)
 
-	ConfigMu.Lock()
-	defer ConfigMu.Unlock()
-
-	data, err := os.ReadFile(ConfigPath())
-	if err != nil {
-		return fmt.Errorf("read config: %w", err)
-	}
-
-	var config map[string]interface{}
-	if err := json.Unmarshal(data, &config); err != nil {
-		return fmt.Errorf("parse config: %w", err)
-	}
-
-	outbounds, ok := config["outbounds"].([]interface{})
-	if !ok {
-		return fmt.Errorf("config outbounds not found")
-	}
-
-	updated := false
-	for i, ob := range outbounds {
-		obMap, ok := ob.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		if obMap["tag"] == "gia-auto" && obMap["type"] == "urltest" {
-			tags := make([]interface{}, len(ordered))
-			for j, name := range ordered {
-				tags[j] = "transit-" + name
-			}
-			obMap["outbounds"] = tags
-			outbounds[i] = obMap
-			updated = true
-			break
-		}
-	}
-
-	if !updated {
-		return fmt.Errorf("gia-auto urltest outbound not found in config")
-	}
-
-	config["outbounds"] = outbounds
-
-	newData, err := json.MarshalIndent(config, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal config: %w", err)
-	}
-
-	return validateAndApplyConfig(newData, "[failover]")
+	return reorderGiaAuto(ordered, "[failover]")
 }
 
 // StartFailoverLoop runs periodic bandwidth balancing on the entry node.
-// It checks every hour and rebalances if needed.
 func StartFailoverLoop(failoverCfg *FailoverConfig, interval time.Duration) {
 	if len(failoverCfg.Transits) == 0 {
 		return
 	}
 
 	go func() {
-		// Initial check after 1 minute
 		time.Sleep(1 * time.Minute)
 		if err := RebalanceEntryConfig(failoverCfg); err != nil {
 			log.Printf("[failover] initial rebalance error: %v", err)
@@ -194,4 +223,98 @@ func StartFailoverLoop(failoverCfg *FailoverConfig, interval time.Duration) {
 
 	log.Printf("[failover] bandwidth balancer started, interval=%s, transits=%d",
 		interval, len(failoverCfg.Transits))
+}
+
+// =============================================================================
+// Topology-driven rebalancer (primary path, reads BWG status from CF)
+// =============================================================================
+
+// RebalanceFromTopology reads transit BWG status from CF topology and reorders
+// the gia-auto urltest group accordingly. No failover.json needed.
+func RebalanceFromTopology(cfClient *CFTopoClient) error {
+	nodes, err := cfClient.GetAllNodes()
+	if err != nil {
+		return fmt.Errorf("cf get nodes: %w", err)
+	}
+
+	type transitBW struct {
+		name    string
+		bwg     *BWGStatus
+		exhaust bool
+	}
+	var transits []transitBW
+	for _, n := range nodes {
+		if n.Role != RoleTransit {
+			continue
+		}
+		if time.Since(n.ReportedAt) > StaleThreshold {
+			continue
+		}
+		transits = append(transits, transitBW{
+			name:    n.Name,
+			bwg:     n.BWGStatus,
+			exhaust: n.BWGStatus.IsExhausted(),
+		})
+	}
+
+	if len(transits) == 0 {
+		return fmt.Errorf("no alive transits in topology")
+	}
+
+	// Sort: exhausted last, then by BWG usage ascending (unlimited first)
+	sort.SliceStable(transits, func(i, j int) bool {
+		if transits[i].exhaust != transits[j].exhaust {
+			return !transits[i].exhaust
+		}
+		return transits[i].bwg.UsedLessThan(transits[j].bwg)
+	})
+
+	// Build ordered list (exclude exhausted unless all exhausted)
+	ordered := make([]string, 0, len(transits))
+	for _, t := range transits {
+		if !t.exhaust {
+			ordered = append(ordered, t.name)
+		}
+	}
+	if len(ordered) == 0 {
+		log.Println("[topo-rebalance] WARNING: all transits exhausted, using all")
+		for _, t := range transits {
+			ordered = append(ordered, t.name)
+		}
+	}
+
+	for _, t := range transits {
+		status := "OK"
+		if t.exhaust {
+			status = "EXHAUSTED"
+		}
+		pctStr := "unlimited"
+		if t.bwg.HasData() {
+			pctStr = fmt.Sprintf("%.1f%% remaining", t.bwg.RemainingPct())
+		}
+		log.Printf("[topo-rebalance] %s: %s %s", t.name, pctStr, status)
+	}
+	log.Printf("[topo-rebalance] balanced order: %v", ordered)
+
+	return reorderGiaAuto(ordered, "[topo-rebalance]")
+}
+
+// StartTopoRebalanceLoop runs periodic topology-driven bandwidth balancing.
+func StartTopoRebalanceLoop(cfClient *CFTopoClient, interval time.Duration) {
+	go func() {
+		time.Sleep(2 * time.Minute) // let initial reconcile settle
+		if err := RebalanceFromTopology(cfClient); err != nil {
+			log.Printf("[topo-rebalance] initial error: %v", err)
+		}
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for range ticker.C {
+			if err := RebalanceFromTopology(cfClient); err != nil {
+				log.Printf("[topo-rebalance] error: %v", err)
+			}
+		}
+	}()
+
+	log.Printf("[topo-rebalance] started, interval=%s", interval)
 }

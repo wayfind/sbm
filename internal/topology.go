@@ -23,6 +23,50 @@ type BWGStatus struct {
 	PlanMonthlyData int64 `json:"plan_monthly_data"`
 }
 
+// HasData returns true if BWG tracking is active with valid monthly quota.
+func (b *BWGStatus) HasData() bool {
+	return b != nil && b.PlanMonthlyData > 0
+}
+
+// RemainingPct returns remaining bandwidth as percentage [0, 100].
+// Returns -1 if BWG tracking is not active.
+func (b *BWGStatus) RemainingPct() float64 {
+	if !b.HasData() {
+		return -1
+	}
+	pct := float64(b.PlanMonthlyData-b.DataCounter) / float64(b.PlanMonthlyData) * 100
+	if pct < 0 {
+		return 0
+	}
+	if pct > 100 {
+		return 100
+	}
+	return pct
+}
+
+// IsExhausted returns true if remaining bandwidth is below 5%.
+func (b *BWGStatus) IsExhausted() bool {
+	return b.HasData() && b.RemainingPct() < 5
+}
+
+// UsedLessThan compares bandwidth usage using integer cross-multiplication
+// to avoid float precision issues. Returns true if b has used proportionally
+// less bandwidth than other. Nil or zero-quota BWGStatus is treated as
+// "unlimited" (always less used than any tracked status).
+func (b *BWGStatus) UsedLessThan(other *BWGStatus) bool {
+	bHas := b.HasData()
+	oHas := other.HasData()
+	if bHas != oHas {
+		return !bHas // unlimited (no tracking) sorts first
+	}
+	if !bHas {
+		return false // both unlimited, equal
+	}
+	// Cross-multiply: b.Used/b.Total < o.Used/o.Total
+	// ⟺ b.Used * o.Total < o.Used * b.Total
+	return b.DataCounter*other.PlanMonthlyData < other.DataCounter*b.PlanMonthlyData
+}
+
 type NodeInfo struct {
 	NodeID     string        `json:"node_id"`
 	Name       string        `json:"name,omitempty"`
@@ -370,21 +414,6 @@ func buildReportURL(upstream UpstreamMeta) string {
 	return "https://" + host + "/report"
 }
 
-// bwgRemainingPct returns remaining bandwidth percentage, clamped to [0, 100].
-func bwgRemainingPct(b *BWGStatus) float64 {
-	if b == nil || b.PlanMonthlyData <= 0 {
-		return -1 // unknown
-	}
-	pct := float64(b.PlanMonthlyData-b.DataCounter) / float64(b.PlanMonthlyData) * 100
-	if pct < 0 {
-		return 0
-	}
-	if pct > 100 {
-		return 100
-	}
-	return pct
-}
-
 // --- Print topology tree (for CLI) ---
 
 func PrintTopologyTree(tree *TopologyTree, indent string) {
@@ -404,7 +433,7 @@ func PrintTopologyTree(tree *TopologyTree, indent string) {
 	}
 
 	fmt.Printf("%s[%s] %s (%s) %s", indent, role, name, addr, status)
-	if pct := bwgRemainingPct(tree.Self.BWGStatus); pct >= 0 {
+	if pct := tree.Self.BWGStatus.RemainingPct(); pct >= 0 {
 		fmt.Printf(" bw=%.1f%%", pct)
 	}
 	fmt.Println()
@@ -443,7 +472,7 @@ func printTopologyNode(tree *TopologyTree, firstPrefix, restPrefix string) {
 	}
 
 	fmt.Printf("%s[%s] %s (%s) %s", firstPrefix, role, name, addr, status)
-	if pct := bwgRemainingPct(tree.Self.BWGStatus); pct >= 0 {
+	if pct := tree.Self.BWGStatus.RemainingPct(); pct >= 0 {
 		fmt.Printf(" bw=%.1f%%", pct)
 	}
 	fmt.Println()

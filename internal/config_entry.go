@@ -59,6 +59,8 @@ type TransitInfo struct {
 	PublicKey string `json:"public_key,omitempty"`
 	ShortID   string `json:"short_id,omitempty"`
 	Insecure  bool   `json:"insecure,omitempty"`
+
+	BWGStatus *BWGStatus `json:"-"` // from topology, not serialized
 }
 
 // ExitInfo describes an exit (家宽) node. Embeds TransitInfo for connection params.
@@ -66,6 +68,20 @@ type ExitInfo struct {
 	TransitInfo
 	// Which transit to chain through (must match a TransitInfo.Name)
 	ViaTransit string `json:"via_transit,omitempty"`
+}
+
+// bwgEqual returns true if two BWGStatus pointers represent the same usage tier
+// for sorting purposes: both nil, or same used/total ratio.
+func bwgEqual(a, b *BWGStatus) bool {
+	aHas, bHas := a.HasData(), b.HasData()
+	if aHas != bHas {
+		return false
+	}
+	if !aHas {
+		return true // both nil/no-data
+	}
+	// Equal ratio: a.Used * b.Total == b.Used * a.Total
+	return a.DataCounter*b.PlanMonthlyData == b.DataCounter*a.PlanMonthlyData
 }
 
 // GenerateEntryConfig generates a full sing-box config for the entry node.
@@ -276,35 +292,61 @@ func buildExitOutbound(tag string, e *ExitInfo) map[string]interface{} {
 
 // BuildEntryOutbounds builds the outbounds section for an entry node config.
 // Used by both GenerateEntryConfig (initial install) and reconcile (auto-update).
-// Transit outbounds are sorted with hy2 first for protocol preference in urltest.
+// Transit outbounds are sorted by: BWG availability → BWG usage (least used first) → hy2 preferred.
+// Exhausted transits (BWG remaining < 5%) are excluded from the urltest group.
 func BuildEntryOutbounds(transits []TransitInfo, exits []ExitInfo) []interface{} {
 	outbounds := []interface{}{}
 
-	// Sort transits: hy2 first (urltest prefers first within tolerance)
+	// Sort transits: BWG-aware, hy2 preferred within same tier
 	type transitWithTag struct {
-		tag   string
-		info  TransitInfo
-		isHy2 bool
+		tag     string
+		info    TransitInfo
+		isHy2   bool
+		exhaust bool // BWG remaining < 5%
 	}
-	sorted := make([]transitWithTag, len(transits))
-	for i, t := range transits {
-		sorted[i] = transitWithTag{
-			tag:   "transit-" + t.Name,
-			info:  t,
-			isHy2: t.Protocol == "hysteria2",
-		}
+	sorted := make([]transitWithTag, 0, len(transits))
+	for _, t := range transits {
+		sorted = append(sorted, transitWithTag{
+			tag:     "transit-" + t.Name,
+			info:    t,
+			isHy2:   t.Protocol == "hysteria2",
+			exhaust: t.BWGStatus.IsExhausted(),
+		})
 	}
 	sort.SliceStable(sorted, func(i, j int) bool {
-		if sorted[i].isHy2 != sorted[j].isHy2 {
-			return sorted[i].isHy2 // hy2 first
+		// Exhausted always last
+		if sorted[i].exhaust != sorted[j].exhaust {
+			return !sorted[i].exhaust
 		}
-		return false // preserve original order within same protocol
+		// Less bandwidth used sorts first (integer cross-multiply, no float)
+		iBWG, jBWG := sorted[i].info.BWGStatus, sorted[j].info.BWGStatus
+		if !bwgEqual(iBWG, jBWG) {
+			return iBWG.UsedLessThan(jBWG)
+		}
+		// hy2 preferred within same tier
+		if sorted[i].isHy2 != sorted[j].isHy2 {
+			return sorted[i].isHy2
+		}
+		return false
 	})
 
-	transitTags := make([]string, len(sorted))
-	for i, s := range sorted {
-		transitTags[i] = s.tag
+	// Build all transit outbounds (even exhausted, for potential manual override)
+	for _, s := range sorted {
 		outbounds = append(outbounds, BuildProxyOutbound(s.tag, &s.info))
+	}
+
+	// urltest group only includes non-exhausted transits
+	transitTags := make([]string, 0, len(sorted))
+	for _, s := range sorted {
+		if !s.exhaust {
+			transitTags = append(transitTags, s.tag)
+		}
+	}
+	if len(transitTags) == 0 {
+		// All exhausted — include all as fallback
+		for _, s := range sorted {
+			transitTags = append(transitTags, s.tag)
+		}
 	}
 
 	outbounds = append(outbounds, map[string]interface{}{

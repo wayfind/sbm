@@ -285,6 +285,7 @@ func pickBestInbound(node NodeInfo) *TransitInfo {
 		SNI:      sni,
 		PublicKey: best.PublicKey,
 		ShortID:  best.ShortID,
+		BWGStatus: node.BWGStatus,
 	}
 }
 

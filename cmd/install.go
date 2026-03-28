@@ -29,6 +29,8 @@ type InstallFlags struct {
 	Name          string
 	CFWorkerURL   string
 	CFAPIKey      string
+	BWGVeid       string
+	BWGAPIKey     string
 }
 
 // cryptoMaterials holds generated keys/passwords for a new installation.
@@ -57,6 +59,8 @@ func RunInstall(args []string) error {
 	fs.StringVar(&f.Name, "name", "", "节点名称 (拓扑显示用)")
 	fs.StringVar(&f.CFWorkerURL, "cf-url", "", "Cloudflare Worker URL (拓扑上报)")
 	fs.StringVar(&f.CFAPIKey, "cf-key", "", "Cloudflare API Key (拓扑认证)")
+	fs.StringVar(&f.BWGVeid, "bwg-veid", "", "搬瓦工 VEID (带宽监控)")
+	fs.StringVar(&f.BWGAPIKey, "bwg-api-key", "", "搬瓦工 API Key (带宽监控)")
 	fs.Parse(args)
 
 	role := internal.NodeRole(f.Role)
@@ -322,6 +326,9 @@ func installServerNode(role internal.NodeRole, f *InstallFlags) error {
 		CFWorkerURL: f.CFWorkerURL,
 		CFAPIKey:    f.CFAPIKey,
 		APIToken:    f.CFAPIKey, // use same key for API auth
+	}
+	if f.BWGVeid != "" && f.BWGAPIKey != "" {
+		meta.BWG = &internal.BWGConfig{VEID: f.BWGVeid, APIKey: f.BWGAPIKey}
 	}
 	if oldMeta != nil {
 		restoreMetaFields(meta, oldMeta)
