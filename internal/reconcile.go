@@ -252,32 +252,13 @@ func ReconcileTransitConfig(meta *Metadata, downstreams []TopologyTree) error {
 	return validateAndApplyConfig(newData, "[reconcile-transit]")
 }
 
-// topoToExitInfos extracts exit connection info from all topology trees.
+// topoToExitInfos extracts exit connection info from all topology trees (transit use).
 func topoToExitInfos(downstreams []TopologyTree) []TransitInfo {
-	seen := map[string]bool{}
-	var result []TransitInfo
-	for _, tree := range downstreams {
-		// Check direct exits (downstreams of each transit tree)
-		for _, exitDS := range tree.Downstreams {
-			if !exitDS.Self.Alive || exitDS.Self.Role != RoleExit {
-				continue
-			}
-			if seen[exitDS.Self.NodeID] {
-				continue
-			}
-			seen[exitDS.Self.NodeID] = true
-			ti := pickBestInbound(exitDS.Self)
-			if ti != nil {
-				result = append(result, *ti)
-			}
-		}
-		// Also check top-level exits (flat CF topology puts exits under transits)
-		if tree.Self.Alive && tree.Self.Role == RoleExit && !seen[tree.Self.NodeID] {
-			seen[tree.Self.NodeID] = true
-			ti := pickBestInbound(tree.Self)
-			if ti != nil {
-				result = append(result, *ti)
-			}
+	nodes := collectExitNodes(downstreams)
+	result := make([]TransitInfo, 0, len(nodes))
+	for _, n := range nodes {
+		if ti := pickBestInbound(n); ti != nil {
+			result = append(result, *ti)
 		}
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
@@ -330,6 +311,8 @@ func assignTransitExitPorts(meta *Metadata, exits []TransitInfo) bool {
 }
 
 // transitConfigNeedsUpdate checks if the transit config needs rebuilding.
+// Compares exit count and key connection fields (address, port, uuid, public_key)
+// rather than full JSON serialization to avoid float64/int type mismatch.
 func transitConfigNeedsUpdate(configData []byte, exits []TransitInfo, meta *Metadata) bool {
 	var config map[string]interface{}
 	if err := json.Unmarshal(configData, &config); err != nil {
@@ -341,37 +324,60 @@ func transitConfigNeedsUpdate(configData []byte, exits []TransitInfo, meta *Meta
 		return true
 	}
 
-	// Compare exit outbound set: desired vs current
-	currentExitTags := map[string]string{} // tag → JSON
+	// Extract current exit outbounds keyed by tag
+	type exitKey struct {
+		server string
+		port   int
+		uuid   string
+		pubKey string
+	}
+	currentExits := map[string]exitKey{}
 	for _, ob := range outbounds {
 		obMap, ok := ob.(map[string]interface{})
 		if !ok {
 			continue
 		}
 		tag, _ := obMap["tag"].(string)
-		if strings.HasPrefix(tag, "exit-") {
-			j, _ := json.Marshal(obMap)
-			currentExitTags[tag] = string(j)
+		if !strings.HasPrefix(tag, "exit-") {
+			continue
 		}
+		p, _ := obMap["server_port"].(float64) // JSON numbers are float64
+		ek := exitKey{
+			server: strVal(obMap, "server"),
+			port:   int(p),
+			uuid:   strVal(obMap, "uuid"),
+		}
+		// public_key is nested in tls.reality
+		if tls, ok := obMap["tls"].(map[string]interface{}); ok {
+			if reality, ok := tls["reality"].(map[string]interface{}); ok {
+				ek.pubKey, _ = reality["public_key"].(string)
+			}
+		}
+		currentExits[tag] = ek
 	}
 
-	if len(currentExitTags) != len(exits) {
+	if len(currentExits) != len(exits) {
 		return true
 	}
 
 	for _, e := range exits {
 		tag := "exit-" + e.Name
-		currentJSON, ok := currentExitTags[tag]
+		cur, ok := currentExits[tag]
 		if !ok {
 			return true
 		}
-		desired := BuildProxyOutbound(tag, &e)
-		desiredJSON, _ := json.Marshal(desired)
-		if currentJSON != string(desiredJSON) {
+		if cur.server != e.Address || cur.port != e.Port ||
+			cur.uuid != e.UUID || cur.pubKey != e.PublicKey {
 			return true
 		}
 	}
 	return false
+}
+
+// strVal extracts a string value from a map, returning "" if missing or wrong type.
+func strVal(m map[string]interface{}, key string) string {
+	v, _ := m[key].(string)
+	return v
 }
 
 // rebuildTransitConfig preserves main inbounds and adds per-exit channels.
@@ -464,31 +470,53 @@ func topoToTransits(downstreams []TopologyTree) []TransitInfo {
 }
 
 func topoToExits(downstreams []TopologyTree) []ExitInfo {
-	var result []ExitInfo
-	seen := map[string]bool{} // dedup exits across transits
+	nodes := collectExitNodes(downstreams)
+	// For entry: each exit needs ViaTransit (first alive transit that has it as downstream)
+	transitForExit := map[string]string{} // exit nodeID → transit name
 	for _, transit := range downstreams {
 		if !transit.Self.Alive || transit.Self.Role != RoleTransit {
 			continue
 		}
 		for _, exitDS := range transit.Downstreams {
-			if !exitDS.Self.Alive || exitDS.Self.Role != RoleExit {
-				continue
-			}
-			if seen[exitDS.Self.NodeID] {
-				continue
-			}
-			seen[exitDS.Self.NodeID] = true
-			ti := pickBestInbound(exitDS.Self)
-			if ti != nil {
-				// ViaTransit: use first available transit (urltest will handle failover)
-				result = append(result, ExitInfo{
-					TransitInfo: *ti,
-					ViaTransit:  transit.Self.Name,
-				})
+			if _, ok := transitForExit[exitDS.Self.NodeID]; !ok {
+				transitForExit[exitDS.Self.NodeID] = transit.Self.Name
 			}
 		}
 	}
+
+	var result []ExitInfo
+	for _, n := range nodes {
+		ti := pickBestInbound(n)
+		if ti != nil {
+			result = append(result, ExitInfo{
+				TransitInfo: *ti,
+				ViaTransit:  transitForExit[n.NodeID],
+			})
+		}
+	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
+	return result
+}
+
+// collectExitNodes extracts unique alive exit NodeInfo from topology trees.
+// Handles both nested exits (under transit trees) and top-level exits (flat CF topology).
+func collectExitNodes(downstreams []TopologyTree) []NodeInfo {
+	seen := map[string]bool{}
+	var result []NodeInfo
+	for _, tree := range downstreams {
+		for _, exitDS := range tree.Downstreams {
+			if !exitDS.Self.Alive || exitDS.Self.Role != RoleExit || seen[exitDS.Self.NodeID] {
+				continue
+			}
+			seen[exitDS.Self.NodeID] = true
+			result = append(result, exitDS.Self)
+		}
+		// Top-level exit (flat CF topology)
+		if tree.Self.Alive && tree.Self.Role == RoleExit && !seen[tree.Self.NodeID] {
+			seen[tree.Self.NodeID] = true
+			result = append(result, tree.Self)
+		}
+	}
 	return result
 }
 
