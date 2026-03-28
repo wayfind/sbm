@@ -464,6 +464,13 @@ func installEntryNode(f *InstallFlags) error {
 		return fmt.Errorf("save config: %w", err)
 	}
 
+	// Write default routing policy (if not already present)
+	if !internal.FileExists(internal.RoutingPolicyPath()) {
+		if err := internal.SaveRoutingPolicy(internal.DefaultRoutingPolicy()); err != nil {
+			return fmt.Errorf("save routing policy: %w", err)
+		}
+	}
+
 	// Metadata
 	nodeID, err := internal.GenerateNodeID()
 	if err != nil {

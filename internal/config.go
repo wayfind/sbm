@@ -92,6 +92,10 @@ type Metadata struct {
 	ExitVlessPorts map[string]int    `json:"exit_vless_ports,omitempty"` // entry: exit_name → per-exit vless inbound port
 	ExitHy2Ports   map[string]int    `json:"exit_hy2_ports,omitempty"`   // entry: exit_name → per-exit hy2 inbound port
 
+	// SBM binary version that last generated/rebuilt the config.
+	// Used by reconcile to detect schema changes after sbm upgrade.
+	SBMVersion string `json:"sbm_version,omitempty"`
+
 	// Transient field: Reality private key recovered from old config (not serialized)
 	PrivateKey string `json:"-"`
 }

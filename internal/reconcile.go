@@ -148,11 +148,15 @@ func ReconcileEntryConfig(meta *Metadata, downstreams []TopologyTree, db *sql.DB
 	}
 
 	usersChanged := desiredUsers != nil && inboundUsersNeedUpdate(data, desiredUsers)
+	versionChanged := meta.SBMVersion != Version
 
-	if !entryConfigNeedsUpdate(data, desiredTransits, desiredExits, meta) && !portsChanged && !usersChanged {
+	if !entryConfigNeedsUpdate(data, desiredTransits, desiredExits, meta) && !portsChanged && !usersChanged && !versionChanged {
 		return nil
 	}
 
+	if versionChanged {
+		log.Printf("[reconcile] sbm version changed: %q → %q, forcing config rebuild", meta.SBMVersion, Version)
+	}
 	log.Printf("[reconcile] entry update: %d transits, %d exits, %d users", len(desiredTransits), len(desiredExits), len(desiredUsers))
 
 	newData, err := rebuildEntryConfig(data, meta, desiredTransits, desiredExits, desiredUsers)
@@ -160,7 +164,10 @@ func ReconcileEntryConfig(meta *Metadata, downstreams []TopologyTree, db *sql.DB
 		return err
 	}
 
-	if portsChanged {
+	if portsChanged || versionChanged {
+		if versionChanged {
+			meta.SBMVersion = Version
+		}
 		if err := meta.Save(); err != nil {
 			log.Printf("[reconcile] save metadata error: %v", err)
 		}
@@ -723,9 +730,8 @@ func rebuildEntryConfig(currentData []byte, meta *Metadata, transits []TransitIn
 	// --- Route: per-exit inbound rules + domain rules + CN/AI/default ---
 	socks5Rule := extractSocks5Rules(config)
 	route := BuildEntryRoute(exits, 0, nil)
-	rules := route["rules"].([]interface{})
 
-	// Insert per-exit inbound rules after DNS + private IP (index 2)
+	// Insert per-exit inbound rules and socks5 rule
 	var perExitRules []interface{}
 	for _, e := range exits {
 		perExitRules = append(perExitRules, map[string]interface{}{
@@ -734,17 +740,7 @@ func rebuildEntryConfig(currentData []byte, meta *Metadata, transits []TransitIn
 			"outbound": "exit-" + e.Name,
 		})
 	}
-	if len(perExitRules) > 0 {
-		newRules := make([]interface{}, 0, len(rules)+len(perExitRules))
-		newRules = append(newRules, rules[:2]...)
-		newRules = append(newRules, perExitRules...)
-		newRules = append(newRules, rules[2:]...)
-		route["rules"] = newRules
-	}
-	if socks5Rule != nil {
-		r := route["rules"].([]interface{})
-		route["rules"] = append(r, socks5Rule)
-	}
+	SplicePerExitRules(route, perExitRules, socks5Rule)
 	config["route"] = route
 
 	return json.MarshalIndent(config, "", "  ")

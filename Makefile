@@ -1,4 +1,4 @@
-VERSION := $(shell grep 'sbmVersion' cmd/info.go | head -1 | sed 's/.*"\(.*\)".*/\1/')
+VERSION := $(shell grep 'Version =' internal/version.go | sed 's/.*"\(.*\)".*/\1/')
 SINGBOX_VERSION := 1.13.3
 SINGBOX_TAGS := with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_v2ray_api,with_tailscale,with_ccm,with_ocm
 

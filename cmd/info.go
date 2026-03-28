@@ -11,8 +11,6 @@ import (
 	"time"
 )
 
-const sbmVersion = "2.5.0"
-
 func RunConfig() error {
 	data, err := os.ReadFile(internal.ConfigPath())
 	if err != nil {
@@ -158,13 +156,13 @@ func RunVersion() error {
 
 	if internal.JSONMode {
 		internal.PrintJSON(map[string]interface{}{
-			"sbm_version":      sbmVersion,
+			"sbm_version":      internal.Version,
 			"singbox_version":  sbVersion,
 		})
 		return nil
 	}
 
-	fmt.Printf("sing-box-manager v%s\n", sbmVersion)
+	fmt.Printf("sing-box-manager v%s\n", internal.Version)
 	if sbVersion != "" {
 		fmt.Println(sbVersion)
 	}

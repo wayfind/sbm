@@ -360,13 +360,11 @@ func jsonError(w http.ResponseWriter, msg string, code int) {
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
-// handleConfigRules returns current routing rules (read-only).
+// handleConfigRules returns current routing policy (read-only).
 func handleConfigRules(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	internal.PrintJSONTo(w, map[string]interface{}{
-		"ai_domains": internal.AIResidentialDomains,
-		"rule_sets":  internal.BuildRuleSetDefs(),
-	})
+	policy := internal.LoadRoutingPolicy()
+	internal.PrintJSONTo(w, policy)
 }
 
 // handleDashboard serves a simple HTML dashboard.

@@ -34,6 +34,8 @@ func main() {
 		err = cmd.RunStop()
 	case "restart":
 		err = cmd.RunRestart()
+	case "reload":
+		err = cmd.RunReload()
 	case "status":
 		err = cmd.RunStatus()
 	case "logs":
@@ -154,6 +156,7 @@ func usage() {
   sbm start                                    启动服务
   sbm stop                                     停止服务
   sbm restart                                  重启服务
+  sbm reload                                   重载路由策略并重启
   sbm status                                   查看状态
   sbm logs [-n 100]                            查看日志
   sbm config                                   查看配置 (脱敏)

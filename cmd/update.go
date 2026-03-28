@@ -35,13 +35,13 @@ func RunUpdate(args []string) error {
 	}
 
 	humanPrint("远程版本: sbm v%s, sing-box %s\n", latest.SBM, latest.SingBox)
-	humanPrint("本地版本: sbm v%s\n", sbmVersion)
+	humanPrint("本地版本: sbm v%s\n", internal.Version)
 
-	if latest.SBM == sbmVersion {
+	if latest.SBM == internal.Version {
 		if internal.JSONMode {
 			internal.PrintJSON(map[string]interface{}{
 				"status":          "up_to_date",
-				"current_version": sbmVersion,
+				"current_version": internal.Version,
 			})
 		} else {
 			humanPrint("已是最新版本\n")
@@ -79,7 +79,7 @@ func RunUpdate(args []string) error {
 		return fmt.Errorf("替换失败: %w", err)
 	}
 
-	humanPrint("sbm 已更新: v%s → v%s\n", sbmVersion, latest.SBM)
+	humanPrint("sbm 已更新: v%s → v%s\n", internal.Version, latest.SBM)
 
 	// 4. Restart sbm-server if running
 	if internal.IsActive("sbm-server") {
@@ -93,7 +93,7 @@ func RunUpdate(args []string) error {
 	if internal.JSONMode {
 		internal.PrintJSON(map[string]interface{}{
 			"status":       "updated",
-			"old_version":  sbmVersion,
+			"old_version":  internal.Version,
 			"new_version":  latest.SBM,
 		})
 	}

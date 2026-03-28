@@ -20,6 +20,10 @@ func RunRestart() error {
 	return internal.SystemctlOp("restart", "sing-box", "sbm-server")
 }
 
+func RunReload() error {
+	return internal.ReloadRoutingPolicy()
+}
+
 func RunStatus() error {
 	singboxActive := internal.IsActive("sing-box")
 	sbmServerActive := internal.IsActive("sbm-server")
