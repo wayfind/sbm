@@ -211,8 +211,19 @@ func ReconcileTransitConfig(meta *Metadata, downstreams []TopologyTree) error {
 	// Assign per-exit ports for new exits
 	portsChanged := assignTransitExitPorts(meta, desiredExits)
 
+	// Sync per-exit inbounds into metadata (for topology reporting to CF).
+	// Done unconditionally — metadata must reflect reality even if config doesn't change.
+	metaChanged := syncTransitInboundMeta(meta, desiredExits)
+
 	ConfigMu.Lock()
 	defer ConfigMu.Unlock()
+
+	// Save metadata inside lock to keep metadata + config atomically consistent
+	if portsChanged || metaChanged {
+		if err := meta.Save(); err != nil {
+			log.Printf("[reconcile] save metadata error: %v", err)
+		}
+	}
 
 	data, err := os.ReadFile(ConfigPath())
 	if err != nil {
@@ -235,13 +246,13 @@ func ReconcileTransitConfig(meta *Metadata, downstreams []TopologyTree) error {
 		return err
 	}
 
-	if portsChanged || versionChanged {
-		if versionChanged {
-			meta.SBMVersion = Version
-		}
+	if versionChanged {
+		meta.SBMVersion = Version
 		if err := meta.Save(); err != nil {
 			log.Printf("[reconcile] save metadata error: %v", err)
 		}
+	}
+	if portsChanged {
 		for name, port := range meta.ExitPorts {
 			if err := FirewallAddPort(port, "tcp"); err != nil {
 				log.Printf("[reconcile] firewall port %d for %s: %v", port, name, err)
@@ -446,6 +457,58 @@ func rebuildTransitConfig(currentData []byte, meta *Metadata, exits []TransitInf
 	}
 
 	return json.MarshalIndent(config, "", "  ")
+}
+
+// syncTransitInboundMeta updates metadata.Inbounds to include per-exit SOCKS5 entries.
+// This ensures topology reporting to CF includes per-exit channel info.
+// Returns true if metadata was changed.
+func syncTransitInboundMeta(meta *Metadata, exits []TransitInfo) bool {
+	// Preserve main inbounds (vless-in, hy2-in), replace per-exit
+	var main []InboundMeta
+	for _, ib := range meta.Inbounds {
+		if ib.ForExit == "" {
+			main = append(main, ib)
+		}
+	}
+
+	// Build desired per-exit set
+	desired := map[string]bool{}
+	for _, e := range exits {
+		port, ok := meta.ExitPorts[e.Name]
+		if !ok {
+			continue
+		}
+		desired[e.Name] = true
+		main = append(main, InboundMeta{
+			Tag:       "for-exit-" + e.Name,
+			Protocol:  "socks",
+			Port:      port,
+			Transport: "tcp",
+			Username:  "sbm",
+			Password:  meta.ExitAuth[e.Name],
+			ForExit:   e.Name,
+		})
+	}
+
+	// Check if changed: compare old per-exit set with new
+	oldExits := map[string]bool{}
+	for _, ib := range meta.Inbounds {
+		if ib.ForExit != "" {
+			oldExits[ib.ForExit] = true
+		}
+	}
+	changed := len(oldExits) != len(desired)
+	if !changed {
+		for name := range desired {
+			if !oldExits[name] {
+				changed = true
+				break
+			}
+		}
+	}
+
+	meta.Inbounds = main
+	return changed
 }
 
 // =============================================================================
