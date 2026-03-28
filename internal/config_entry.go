@@ -365,6 +365,12 @@ func BuildEntryRoute(exits []ExitInfo, socks5Port int, socks5DirectIPs []string)
 	}
 
 	if len(exits) > 0 {
+		// Google domains → residential (before AI list, broader match)
+		rules = append(rules, map[string]interface{}{
+			"rule_set": "geosite-google",
+			"action":   "route",
+			"outbound": "residential",
+		})
 		rules = append(rules, map[string]interface{}{
 			"domain":   AIResidentialDomains,
 			"action":   "route",

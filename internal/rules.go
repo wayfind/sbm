@@ -28,9 +28,10 @@ var AIResidentialDomains = []string{
 
 // Rule set URLs — using jsdelivr CDN mirror (accessible from China).
 const (
-	RuleSetGeositeCN    = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-cn.srs"
-	RuleSetGeositeNotCN = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs"
-	RuleSetGeoipCN      = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs"
+	RuleSetGeositeCN     = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-cn.srs"
+	RuleSetGeositeNotCN  = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-!cn.srs"
+	RuleSetGeoipCN       = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs"
+	RuleSetGeositeGoogle = "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/google.srs"
 
 	// Local rule set paths (pre-downloaded to avoid startup blocking)
 	RuleSetLocalDir = "/etc/sing-box/rules"
@@ -40,29 +41,30 @@ const (
 // Uses local files if they exist (avoids sing-box startup blocking on download),
 // falls back to remote URLs.
 func BuildRuleSetDefs() []map[string]interface{} {
-	geositePath := RuleSetLocalDir + "/geosite-cn.srs"
-	geoipPath := RuleSetLocalDir + "/geoip-cn.srs"
-
-	geosite := map[string]interface{}{"tag": "geosite-cn", "format": "binary"}
-	geoip := map[string]interface{}{"tag": "geoip-cn", "format": "binary"}
-
-	if fileExists(geositePath) {
-		geosite["type"] = "local"
-		geosite["path"] = geositePath
-	} else {
-		geosite["type"] = "remote"
-		geosite["url"] = RuleSetGeositeCN
+	type rsDef struct {
+		tag       string
+		localFile string
+		remoteURL string
+	}
+	defs := []rsDef{
+		{"geosite-cn", RuleSetLocalDir + "/geosite-cn.srs", RuleSetGeositeCN},
+		{"geoip-cn", RuleSetLocalDir + "/geoip-cn.srs", RuleSetGeoipCN},
+		{"geosite-google", RuleSetLocalDir + "/geosite-google.srs", RuleSetGeositeGoogle},
 	}
 
-	if fileExists(geoipPath) {
-		geoip["type"] = "local"
-		geoip["path"] = geoipPath
-	} else {
-		geoip["type"] = "remote"
-		geoip["url"] = RuleSetGeoipCN
+	var result []map[string]interface{}
+	for _, d := range defs {
+		rs := map[string]interface{}{"tag": d.tag, "format": "binary"}
+		if fileExists(d.localFile) {
+			rs["type"] = "local"
+			rs["path"] = d.localFile
+		} else {
+			rs["type"] = "remote"
+			rs["url"] = d.remoteURL
+		}
+		result = append(result, rs)
 	}
-
-	return []map[string]interface{}{geosite, geoip}
+	return result
 }
 
 func fileExists(path string) bool {
