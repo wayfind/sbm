@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"log"
@@ -512,13 +513,22 @@ func outboundsByTag(outbounds []interface{}) map[string]string {
 		// For urltest/selector: sort inner outbounds array for order-independent comparison
 		typ, _ := obMap["type"].(string)
 		if typ == "urltest" || typ == "selector" {
-			if inner, ok := obMap["outbounds"].([]interface{}); ok {
-				sorted := make([]string, 0, len(inner))
+			// Extract inner outbounds as []string, handling both []interface{} (from JSON)
+			// and []string (from code-built maps) to ensure both sides get sorted.
+			var sorted []string
+			switch inner := obMap["outbounds"].(type) {
+			case []interface{}:
+				sorted = make([]string, 0, len(inner))
 				for _, v := range inner {
 					if s, ok := v.(string); ok {
 						sorted = append(sorted, s)
 					}
 				}
+			case []string:
+				sorted = make([]string, len(inner))
+				copy(sorted, inner)
+			}
+			if len(sorted) > 0 {
 				sort.Strings(sorted)
 				sortedIface := make([]interface{}, len(sorted))
 				for i, s := range sorted {
@@ -860,6 +870,15 @@ func deepCopyMap(m map[string]interface{}) map[string]interface{} {
 }
 
 func validateAndApplyConfig(newData []byte, logPrefix string) error {
+	// Skip restart if config is byte-identical to current file.
+	// This relies on json.MarshalIndent producing deterministic output (Go sorts
+	// map keys). If a future rebuild introduces non-deterministic fields (timestamps,
+	// random values), this guard will silently break — keep rebuild output pure.
+	if current, err := os.ReadFile(ConfigPath()); err == nil && bytes.Equal(current, newData) {
+		log.Printf("%s config unchanged, skipping restart", logPrefix)
+		return nil
+	}
+
 	tmpFile := ConfigPath() + ".tmp"
 	if err := os.WriteFile(tmpFile, newData, 0600); err != nil {
 		return err

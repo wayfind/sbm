@@ -196,6 +196,68 @@ func TestInboundUsersNeedUpdateExtraUser(t *testing.T) {
 	}
 }
 
+// ── outboundsByTag: []string vs []interface{} consistency ───────────────────
+
+func TestOutboundsByTagStringVsInterface(t *testing.T) {
+	// Code-built path: outbounds as []interface{} (after fix in BuildEntryOutbounds)
+	codeBuilt := []interface{}{
+		map[string]interface{}{
+			"type":      "urltest",
+			"tag":       "gia-auto",
+			"outbounds": []interface{}{"transit-shuzuan", "transit-metask", "transit-yl"},
+		},
+		map[string]interface{}{
+			"type":      "selector",
+			"tag":       "residential",
+			"outbounds": []interface{}{"exit-lisa", "exit-bob"},
+			"default":   "exit-lisa",
+		},
+	}
+
+	// JSON-deserialized path: same data but reverse order (simulates reading from file)
+	jsonRaw := `[
+		{"type":"urltest","tag":"gia-auto","outbounds":["transit-yl","transit-metask","transit-shuzuan"]},
+		{"type":"selector","tag":"residential","outbounds":["exit-bob","exit-lisa"],"default":"exit-lisa"}
+	]`
+	var fromJSON []interface{}
+	if err := json.Unmarshal([]byte(jsonRaw), &fromJSON); err != nil {
+		t.Fatal(err)
+	}
+
+	codeResult := outboundsByTag(codeBuilt)
+	jsonResult := outboundsByTag(fromJSON)
+
+	for _, tag := range []string{"gia-auto", "residential"} {
+		if codeResult[tag] != jsonResult[tag] {
+			t.Errorf("tag %q mismatch:\n  code: %s\n  json: %s", tag, codeResult[tag], jsonResult[tag])
+		}
+	}
+}
+
+// Defense: outboundsByTag still handles []string (from legacy or third-party callers)
+func TestOutboundsByTagStringSliceDefense(t *testing.T) {
+	withStringSlice := []interface{}{
+		map[string]interface{}{
+			"type":      "urltest",
+			"tag":       "gia-auto",
+			"outbounds": []string{"transit-b", "transit-a"},
+		},
+	}
+	withIfaceSlice := []interface{}{
+		map[string]interface{}{
+			"type":      "urltest",
+			"tag":       "gia-auto",
+			"outbounds": []interface{}{"transit-a", "transit-b"},
+		},
+	}
+
+	r1 := outboundsByTag(withStringSlice)
+	r2 := outboundsByTag(withIfaceSlice)
+	if r1["gia-auto"] != r2["gia-auto"] {
+		t.Errorf("[]string vs []interface{} mismatch:\n  string: %s\n  iface:  %s", r1["gia-auto"], r2["gia-auto"])
+	}
+}
+
 // ── Test helpers ────────────────────────────────────────────────────────────
 
 // makeConfig round-trips through JSON to simulate a parsed sing-box config.

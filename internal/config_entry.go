@@ -336,7 +336,7 @@ func BuildEntryOutbounds(transits []TransitInfo, exits []ExitInfo) []interface{}
 	}
 
 	// urltest group only includes non-exhausted transits
-	transitTags := make([]string, 0, len(sorted))
+	transitTags := make([]interface{}, 0, len(sorted))
 	for _, s := range sorted {
 		if !s.exhaust {
 			transitTags = append(transitTags, s.tag)
@@ -365,7 +365,7 @@ func BuildEntryOutbounds(transits []TransitInfo, exits []ExitInfo) []interface{}
 	}
 
 	if len(exits) > 0 {
-		exitTags := make([]string, len(exits))
+		exitTags := make([]interface{}, len(exits))
 		for i, e := range exits {
 			exitTags[i] = "exit-" + e.Name
 		}
@@ -390,11 +390,14 @@ func BuildEntryOutbounds(transits []TransitInfo, exits []ExitInfo) []interface{}
 // stickyFirstExit picks the first exit tag as the selector default.
 // When an exit goes offline, reconcile removes it from the list,
 // and the next available exit becomes the new default.
-func stickyFirstExit(exitTags []string) string {
+func stickyFirstExit(exitTags []interface{}) string {
 	if len(exitTags) == 0 {
 		return ""
 	}
-	return exitTags[0]
+	if s, ok := exitTags[0].(string); ok {
+		return s
+	}
+	return ""
 }
 
 // BuildEntryRoute builds the route section for an entry node config.
