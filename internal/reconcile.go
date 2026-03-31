@@ -68,23 +68,36 @@ func getTopoFromDualView(meta *Metadata, store *TopoStore, cfClient *CFTopoClien
 
 	cfDownstreams := cfNodesToDownstreams(cfNodes, meta)
 
-	// Consistency check (only compare relevant roles)
-	cfIDs := map[string]bool{}
-	for _, d := range cfDownstreams {
-		cfIDs[d.Self.NodeID] = true
-	}
-	localIDs := map[string]bool{}
-	for _, d := range localDownstreams {
-		localIDs[d.Self.NodeID] = true
-	}
-	for id := range cfIDs {
-		if !localIDs[id] {
-			log.Printf("[reconcile] ALERT: node %s in CF but not in chain → data-plane break?", id)
+	// Consistency check: only warn about nodes that should be reachable via chain
+	// (i.e., configured as upstreams) but aren't. CF-only nodes are expected —
+	// that's the whole point of CF as a discovery supplement.
+	if len(meta.Upstreams) > 0 {
+		localIDs := map[string]bool{}
+		for _, d := range localDownstreams {
+			localIDs[d.Self.NodeID] = true
 		}
-	}
-	for id := range localIDs {
-		if !cfIDs[id] {
-			log.Printf("[reconcile] WARN: node %s in chain but not in CF → CF channel issue?", id)
+		// Build upstream address set for matching
+		upstreamAddrs := map[string]bool{}
+		for _, u := range meta.Upstreams {
+			upstreamAddrs[u.Address] = true
+		}
+		for _, d := range cfDownstreams {
+			if !localIDs[d.Self.NodeID] && upstreamAddrs[d.Self.Address] {
+				log.Printf("[reconcile] ALERT: upstream %s (%s) in CF but not in chain → data-plane break?",
+					d.Self.Name, d.Self.Address)
+			}
+		}
+		for _, d := range localDownstreams {
+			found := false
+			for _, cd := range cfDownstreams {
+				if cd.Self.NodeID == d.Self.NodeID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				log.Printf("[reconcile] WARN: node %s in chain but not in CF → CF channel issue?", d.Self.Name)
+			}
 		}
 	}
 

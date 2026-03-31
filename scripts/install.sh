@@ -29,6 +29,8 @@ SKIP_INSTALL=""
 NAME=""
 CF_URL=""
 CF_KEY=""
+BWG_VEID=""
+BWG_API_KEY=""
 EXTRA_ARGS=()
 
 while [ $# -gt 0 ]; do
@@ -40,6 +42,8 @@ while [ $# -gt 0 ]; do
         --name)    NAME="$2"; shift 2 ;;
         --cf-url)  CF_URL="$2"; shift 2 ;;
         --cf-key)  CF_KEY="$2"; shift 2 ;;
+        --bwg-veid) BWG_VEID="$2"; shift 2 ;;
+        --bwg-api-key) BWG_API_KEY="$2"; shift 2 ;;
         --force)   EXTRA_ARGS+=(--force); shift ;;
         --cert)    EXTRA_ARGS+=(--cert "$2"); shift 2 ;;
         --key)     EXTRA_ARGS+=(--key "$2"); shift 2 ;;
@@ -53,6 +57,8 @@ while [ $# -gt 0 ]; do
             echo "  --name <名称>               节点名称 (拓扑显示用)"
             echo "  --cf-url <URL>              Cloudflare Worker URL (拓扑上报)"
             echo "  --cf-key <KEY>              Cloudflare API Key (拓扑认证)"
+            echo "  --bwg-veid <VEID>           搬瓦工 VEID (带宽监控)"
+            echo "  --bwg-api-key <KEY>         搬瓦工 API Key (带宽监控)"
             echo "  --upstreams <文件>           上游配置文件 (entry 必需)"
             echo "  --force                      跳过替换确认"
             echo "  --cert <路径>                TLS 证书文件"
@@ -215,6 +221,8 @@ cmd=(sbm install --role "$ROLE" --force)
 [ -n "$NAME" ] && cmd+=(--name "$NAME")
 [ -n "$CF_URL" ] && cmd+=(--cf-url "$CF_URL")
 [ -n "$CF_KEY" ] && cmd+=(--cf-key "$CF_KEY")
+[ -n "$BWG_VEID" ] && cmd+=(--bwg-veid "$BWG_VEID")
+[ -n "$BWG_API_KEY" ] && cmd+=(--bwg-api-key "$BWG_API_KEY")
 cmd+=("${EXTRA_ARGS[@]}")
 
 info "执行: ${cmd[*]}"

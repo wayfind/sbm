@@ -503,6 +503,9 @@ func installEntryNode(f *InstallFlags) error {
 		CFAPIKey:    f.CFAPIKey,
 		APIToken:    f.CFAPIKey,
 	}
+	if f.BWGVeid != "" && f.BWGAPIKey != "" {
+		meta.BWG = &internal.BWGConfig{VEID: f.BWGVeid, APIKey: f.BWGAPIKey}
+	}
 	if oldMeta != nil {
 		restoreMetaFields(meta, oldMeta)
 	}
