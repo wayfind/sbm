@@ -355,7 +355,7 @@ func BuildEntryOutbounds(transits []TransitInfo, exits []ExitInfo) []interface{}
 		"outbounds": transitTags,
 		"url":       "https://www.gstatic.com/generate_204",
 		"interval":  "5m",
-		"tolerance": 100,
+		"tolerance": 500,
 	})
 
 	for _, e := range exits {

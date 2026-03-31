@@ -113,7 +113,7 @@ func RunServe(args []string) error {
 	// Fallback: failover.json (manual BWG credentials, for nodes without CF)
 	if meta.Role == internal.RoleEntry {
 		if cfClient != nil {
-			internal.StartTopoRebalanceLoop(cfClient, 1*time.Hour)
+			internal.StartTopoRebalanceLoop(cfClient, 3) // daily at 03:00
 		} else if failoverCfg, err := loadFailoverConfig(); err == nil && len(failoverCfg.Transits) > 0 {
 			internal.StartFailoverLoop(failoverCfg, 1*time.Hour)
 		}

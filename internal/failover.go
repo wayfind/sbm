@@ -299,22 +299,30 @@ func RebalanceFromTopology(cfClient *CFTopoClient) error {
 	return reorderGiaAuto(ordered, "[topo-rebalance]")
 }
 
-// StartTopoRebalanceLoop runs periodic topology-driven bandwidth balancing.
-func StartTopoRebalanceLoop(cfClient *CFTopoClient, interval time.Duration) {
+// StartTopoRebalanceLoop runs daily bandwidth balancing at a fixed hour.
+// It picks the transit with the most remaining BWG quota and puts it first
+// in the gia-auto urltest group. Combined with tolerance=500, this ensures
+// the selected transit stays active until the next daily rotation.
+func StartTopoRebalanceLoop(cfClient *CFTopoClient, dailyHour int) {
 	go func() {
 		time.Sleep(2 * time.Minute) // let initial reconcile settle
 		if err := RebalanceFromTopology(cfClient); err != nil {
 			log.Printf("[topo-rebalance] initial error: %v", err)
 		}
 
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for range ticker.C {
+		for {
+			now := time.Now()
+			next := time.Date(now.Year(), now.Month(), now.Day(), dailyHour, 0, 0, 0, now.Location())
+			if !next.After(now) {
+				next = next.Add(24 * time.Hour)
+			}
+			time.Sleep(time.Until(next))
+
 			if err := RebalanceFromTopology(cfClient); err != nil {
 				log.Printf("[topo-rebalance] error: %v", err)
 			}
 		}
 	}()
 
-	log.Printf("[topo-rebalance] started, interval=%s", interval)
+	log.Printf("[topo-rebalance] started, daily at %02d:00", dailyHour)
 }
