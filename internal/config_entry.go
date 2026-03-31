@@ -80,8 +80,8 @@ func bwgEqual(a, b *BWGStatus) bool {
 	if !aHas {
 		return true // both nil/no-data
 	}
-	// Equal ratio: a.Used * b.Total == b.Used * a.Total
-	return a.DataCounter*b.PlanMonthlyData == b.DataCounter*a.PlanMonthlyData
+	// Equal ratio: compare as float64 (avoids int64 overflow with large BWG quotas)
+	return float64(a.DataCounter)/float64(a.PlanMonthlyData) == float64(b.DataCounter)/float64(b.PlanMonthlyData)
 }
 
 // GenerateEntryConfig generates a full sing-box config for the entry node.

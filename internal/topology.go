@@ -49,10 +49,9 @@ func (b *BWGStatus) IsExhausted() bool {
 	return b.HasData() && b.RemainingPct() < 5
 }
 
-// UsedLessThan compares bandwidth usage using integer cross-multiplication
-// to avoid float precision issues. Returns true if b has used proportionally
-// less bandwidth than other. Nil or zero-quota BWGStatus is treated as
-// "unlimited" (always less used than any tracked status).
+// UsedLessThan compares bandwidth usage ratio. Returns true if b has used
+// proportionally less bandwidth than other. Nil or zero-quota BWGStatus is
+// treated as "unlimited" (always less used than any tracked status).
 func (b *BWGStatus) UsedLessThan(other *BWGStatus) bool {
 	bHas := b.HasData()
 	oHas := other.HasData()
@@ -62,9 +61,9 @@ func (b *BWGStatus) UsedLessThan(other *BWGStatus) bool {
 	if !bHas {
 		return false // both unlimited, equal
 	}
-	// Cross-multiply: b.Used/b.Total < o.Used/o.Total
-	// ⟺ b.Used * o.Total < o.Used * b.Total
-	return b.DataCounter*other.PlanMonthlyData < other.DataCounter*b.PlanMonthlyData
+	// Compare usage ratios as float64. Values are bandwidth counters (max ~2TB)
+	// and quotas (~2TB), well within float64's 52-bit mantissa precision.
+	return float64(b.DataCounter)/float64(b.PlanMonthlyData) < float64(other.DataCounter)/float64(other.PlanMonthlyData)
 }
 
 type NodeInfo struct {
