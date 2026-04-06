@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -67,16 +68,18 @@ func (b *BWGStatus) UsedLessThan(other *BWGStatus) bool {
 }
 
 type NodeInfo struct {
-	NodeID     string        `json:"node_id"`
-	Name       string        `json:"name,omitempty"`
-	Role       NodeRole      `json:"role"`
-	Domain     string        `json:"domain,omitempty"`
-	Address    string        `json:"address,omitempty"`
-	SubPort    int           `json:"sub_port,omitempty"`
-	Inbounds   []InboundMeta `json:"inbounds,omitempty"`
-	BWGStatus  *BWGStatus    `json:"bwg_status,omitempty"`
-	Alive      bool          `json:"alive"`
-	ReportedAt time.Time     `json:"reported_at"`
+	NodeID         string        `json:"node_id"`
+	Name           string        `json:"name,omitempty"`
+	Role           NodeRole      `json:"role"`
+	Domain         string        `json:"domain,omitempty"`
+	Address        string        `json:"address,omitempty"`
+	SubPort        int           `json:"sub_port,omitempty"`
+	Inbounds       []InboundMeta `json:"inbounds,omitempty"`
+	BWGStatus      *BWGStatus    `json:"bwg_status,omitempty"`
+	SBMVersion     string        `json:"sbm_version,omitempty"`
+	SingBoxVersion string        `json:"singbox_version,omitempty"`
+	Alive          bool          `json:"alive"`
+	ReportedAt     time.Time     `json:"reported_at"`
 }
 
 type TopologyTree struct {
@@ -171,17 +174,38 @@ func getCachedBWG() *BWGStatus {
 
 // --- Build self NodeInfo from metadata ---
 
+// cachedSingBoxVersion is detected once at first use.
+var (
+	cachedSingBoxVersion     string
+	cachedSingBoxVersionOnce sync.Once
+)
+
+func getSingBoxVersion() string {
+	cachedSingBoxVersionOnce.Do(func() {
+		out, err := exec.Command("sing-box", "version").Output()
+		if err != nil {
+			return
+		}
+		// First line: "sing-box version 1.13.3"
+		line := strings.SplitN(strings.TrimSpace(string(out)), "\n", 2)[0]
+		cachedSingBoxVersion = strings.TrimPrefix(strings.TrimSpace(line), "sing-box version ")
+	})
+	return cachedSingBoxVersion
+}
+
 func BuildNodeInfo(meta *Metadata) NodeInfo {
 	info := NodeInfo{
-		NodeID:     meta.NodeID,
-		Name:       meta.Name,
-		Role:       meta.Role,
-		Domain:     meta.Domain,
-		SubPort:    meta.SubPort,
-		Inbounds:   meta.Inbounds,
-		BWGStatus:  getCachedBWG(),
-		Alive:      true,
-		ReportedAt: time.Now(),
+		NodeID:         meta.NodeID,
+		Name:           meta.Name,
+		Role:           meta.Role,
+		Domain:         meta.Domain,
+		SubPort:        meta.SubPort,
+		Inbounds:       meta.Inbounds,
+		BWGStatus:      getCachedBWG(),
+		SBMVersion:     Version,
+		SingBoxVersion: getSingBoxVersion(),
+		Alive:          true,
+		ReportedAt:     time.Now(),
 	}
 	// Use domain as address, or detect public IP if no domain
 	if meta.Domain != "" {

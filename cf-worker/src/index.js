@@ -405,6 +405,9 @@ function renderTopology() {
       html += '<div class="bwg-bar"><div class="bwg-fill ' + barClass + '" style="width:' + pct + '%"></div>';
       html += '<span class="bwg-text">' + remaining + '% 剩余</span></div>';
     }
+    if (n.sbm_version || n.singbox_version) {
+      html += '<div style="font-size:11px;color:#6e7681;margin-top:4px">sbm ' + esc(n.sbm_version || '?') + ' / sb ' + esc(n.singbox_version || '?') + '</div>';
+    }
     html += '<div class="node-ts">' + ago(n.reported_at) + '</div>';
     html += '</div>';
 
