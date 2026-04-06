@@ -382,7 +382,7 @@ function renderTopology() {
         var ib = inbs[j];
         if (ib.protocol === 'socks' && ib.username && n.domain) {
           var socksUri = 'socks5://' + encodeURIComponent(ib.username) + ':' + encodeURIComponent(ib.password) + '@' + encodeURIComponent(n.domain) + ':' + ib.port;
-          html += '<div class="socks-link" data-uri="' + socksUri.replace(/"/g, '&quot;') + '" onclick="navigator.clipboard.writeText(this.dataset.uri);this.classList.add(\'copied\');var el=this;setTimeout(function(){el.classList.remove(\'copied\')},1500)" style="cursor:pointer;font-size:11px;word-break:break-all;margin:4px 0;padding:4px 6px;background:#1c2128;border-radius:4px;color:#7ee787"></div>';
+          html += '<div class="socks-link" data-uri="' + socksUri.replace(/"/g, '&quot;') + '" onclick="navigator.clipboard.writeText(this.dataset.uri)" style="cursor:pointer;font-size:11px;word-break:break-all;margin:4px 0;padding:4px 6px;background:#1c2128;border-radius:4px;color:#7ee787"></div>';
         } else {
           html += '<span class="port">' + esc(ib.protocol) + ' :' + ib.port + '</span>';
         }
@@ -547,21 +547,42 @@ function loadRules() {
 function renderRules(data) {
   var domEl = document.getElementById('ai-domains');
   var rsEl = document.getElementById('rule-sets');
-  var domains = data.ai_domains || data.domains || [];
-  var ruleSets = data.rule_sets || [];
+
+  // Extract AI residential domains from rules
+  var domains = [];
+  var rules = data.rules || [];
+  for (var i = 0; i < rules.length; i++) {
+    var r = rules[i];
+    if (r.outbound !== 'residential') continue;
+    if (r.domain) domains = domains.concat(r.domain);
+    if (r.domain_suffix) domains = domains.concat(r.domain_suffix);
+  }
 
   var dhtml = '';
   for (var i = 0; i < domains.length; i++) {
-    dhtml += '<span class="domain-tag">' + domains[i] + '</span>';
+    dhtml += '<span class="domain-tag">' + esc(domains[i]) + '</span>';
   }
   domEl.innerHTML = dhtml || '<span style="color:#484f58">无</span>';
 
+  // Rule sets: API returns {tag: url} map
+  var ruleSetMap = data.rule_sets || {};
   var rhtml = '';
-  for (var j = 0; j < ruleSets.length; j++) {
-    var rs = ruleSets[j];
-    rhtml += '<tr><td>' + (rs.tag || '-') + '</td>';
-    rhtml += '<td>' + (rs.outbound || '-') + '</td>';
-    rhtml += '<td><a href="' + (rs.url || '#') + '" target="_blank">' + (rs.url || '-') + '</a></td></tr>';
+  var tags = Object.keys(ruleSetMap).sort();
+  for (var j = 0; j < tags.length; j++) {
+    var tag = tags[j];
+    var url = ruleSetMap[tag];
+    // Find which outbound this rule_set routes to
+    var outbound = '-';
+    for (var k = 0; k < rules.length; k++) {
+      var rs = rules[k].rule_set;
+      if (rs === tag || (Array.isArray(rs) && rs.indexOf(tag) >= 0)) {
+        outbound = rules[k].outbound || '-';
+        break;
+      }
+    }
+    rhtml += '<tr><td>' + esc(tag) + '</td>';
+    rhtml += '<td>' + esc(outbound) + '</td>';
+    rhtml += '<td><a href="' + esc(url) + '" target="_blank" style="color:#58a6ff">' + esc(url) + '</a></td></tr>';
   }
   rsEl.innerHTML = rhtml || '<tr><td colspan="3" style="color:#484f58;text-align:center;padding:16px">无</td></tr>';
 }
