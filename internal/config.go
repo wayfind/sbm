@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 const (
@@ -75,6 +76,9 @@ type Metadata struct {
 
 	Inbounds  []InboundMeta  `json:"inbounds,omitempty"`
 	Upstreams []UpstreamMeta `json:"upstreams,omitempty"`
+
+	// UpstreamsMu protects concurrent read/write of Upstreams (reconcile vs topology reporter).
+	UpstreamsMu sync.RWMutex `json:"-"`
 
 	SubPort  int    `json:"sub_port,omitempty"`
 	APIToken string `json:"api_token,omitempty"`
@@ -242,6 +246,7 @@ type SBLog struct {
 
 type SBUser struct {
 	Name     string `json:"name,omitempty"`
+	Username string `json:"username,omitempty"`
 	UUID     string `json:"uuid,omitempty"`
 	Flow     string `json:"flow,omitempty"`
 	Password string `json:"password,omitempty"`
@@ -327,6 +332,9 @@ type InstallParams struct {
 	ObfsPass   string
 	CertFile   string // certbot certificate path (alternative to ACME)
 	KeyFile    string // certbot key path
+	Socks5Port int
+	Socks5User string
+	Socks5Pass string
 }
 
 // --- Helpers ---

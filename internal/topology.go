@@ -295,7 +295,7 @@ func HandleReport(store *TopoStore) http.HandlerFunc {
 // StartTopologyReporter starts a goroutine that periodically reports this node's
 // info via two channels: Cloudflare KV (if configured) and chain /report (if upstreams configured).
 func StartTopologyReporter(meta *Metadata, store *TopoStore, cfClient *CFTopoClient, interval time.Duration) {
-	hasChain := len(meta.Upstreams) > 0
+	hasChain := len(meta.Upstreams) > 0 || cfClient != nil // CF can populate upstreams via reconcile
 	hasCF := cfClient != nil
 
 	if !hasChain && !hasCF {
@@ -350,8 +350,13 @@ func doReport(meta *Metadata, store *TopoStore, cfClient *CFTopoClient, chainCli
 	}
 
 	// Channel B: Chain /report to upstreams (full tree)
-	if chainClient != nil && len(meta.Upstreams) > 0 {
-		reportToUpstreams(meta, store, chainClient)
+	if chainClient != nil {
+		meta.UpstreamsMu.RLock()
+		hasUpstreams := len(meta.Upstreams) > 0
+		meta.UpstreamsMu.RUnlock()
+		if hasUpstreams {
+			reportToUpstreams(meta, store, chainClient)
+		}
 	}
 }
 
@@ -363,7 +368,13 @@ func reportToUpstreams(meta *Metadata, store *TopoStore, client *http.Client) {
 		return
 	}
 
-	for _, upstream := range meta.Upstreams {
+	// Snapshot upstreams under read lock to avoid race with ReconcileUpstreams
+	meta.UpstreamsMu.RLock()
+	upstreams := make([]UpstreamMeta, len(meta.Upstreams))
+	copy(upstreams, meta.Upstreams)
+	meta.UpstreamsMu.RUnlock()
+
+	for _, upstream := range upstreams {
 		reportURL := buildReportURL(upstream)
 		if reportURL == "" {
 			continue

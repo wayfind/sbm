@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
@@ -18,7 +19,8 @@ var ConfigMu sync.Mutex
 
 // StartReconcileLoop starts periodic reconciliation.
 // Entry: auto-configure transit/exit outbounds from topology.
-// Transit: auto-configure per-exit channels from topology.
+// Transit: auto-configure per-exit channels from topology + discover entry upstreams.
+// Exit: discover transit upstreams for chain reporting.
 func StartReconcileLoop(meta *Metadata, store *TopoStore, cfClient *CFTopoClient, db *sql.DB, interval time.Duration) {
 	var reconcileFunc func()
 
@@ -32,10 +34,17 @@ func StartReconcileLoop(meta *Metadata, store *TopoStore, cfClient *CFTopoClient
 		}
 	case RoleTransit:
 		reconcileFunc = func() {
+			ReconcileUpstreams(meta, cfClient)
 			downstreams := getTopoFromDualView(meta, store, cfClient)
 			if err := ReconcileTransitConfig(meta, downstreams); err != nil {
 				log.Printf("[reconcile] error: %v", err)
 			}
+		}
+	case RoleExit:
+		// Exit only discovers upstreams; topology changes are rare — use longer interval.
+		interval = 10 * time.Minute
+		reconcileFunc = func() {
+			ReconcileUpstreams(meta, cfClient)
 		}
 	default:
 		log.Printf("[reconcile] role=%s, no reconcile needed", meta.Role)
@@ -272,6 +281,116 @@ func ReconcileTransitConfig(meta *Metadata, downstreams []TopologyTree) error {
 
 	log.Printf("[reconcile-transit] exit list updated: %d exits", len(desired))
 	return meta.Save()
+}
+
+// =============================================================================
+// Upstream auto-discovery from CF dashboard
+// =============================================================================
+
+// ReconcileUpstreams discovers upstream nodes from CF and updates metadata.
+// exit → discovers transit, transit → discovers entry.
+// Returns true if upstreams changed.
+// NOTE: single-writer — only called from the reconcile loop goroutine.
+// The RWMutex protects against concurrent reads from the topology reporter,
+// not against multiple writers.
+func ReconcileUpstreams(meta *Metadata, cfClient *CFTopoClient) bool {
+	if cfClient == nil {
+		return false
+	}
+
+	var targetRole NodeRole
+	switch meta.Role {
+	case RoleExit:
+		targetRole = RoleTransit
+	case RoleTransit:
+		targetRole = RoleEntry
+	default:
+		return false
+	}
+
+	nodes, err := cfClient.GetAllNodes()
+	if err != nil {
+		log.Printf("[reconcile-upstream] CF error: %v", err)
+		return false
+	}
+
+	now := time.Now()
+	var discovered []UpstreamMeta
+	for _, n := range nodes {
+		if n.Role != targetRole || n.NodeID == meta.NodeID {
+			continue
+		}
+		if now.Sub(n.ReportedAt) > StaleThreshold {
+			continue
+		}
+		addr := n.Domain
+		if addr == "" {
+			addr = n.Address
+		}
+		if addr == "" {
+			continue
+		}
+		subPort := n.SubPort
+		if subPort == 0 {
+			subPort = 20033
+		}
+		discovered = append(discovered, UpstreamMeta{
+			Name:    n.Name,
+			Address: addr,
+			SubURL:  fmt.Sprintf("https://%s:%d/sub/x", addr, subPort),
+		})
+	}
+	sort.Slice(discovered, func(i, j int) bool { return discovered[i].Name < discovered[j].Name })
+
+	// Don't clear existing upstreams if CF returned no alive targets —
+	// preserves chain connectivity when CF data is temporarily stale.
+	if len(discovered) == 0 {
+		if len(meta.Upstreams) > 0 {
+			log.Printf("[reconcile-upstream] no alive %s nodes in CF, keeping %d existing upstreams", targetRole, len(meta.Upstreams))
+		}
+		return false
+	}
+
+	// Compare with current upstreams by address set
+	meta.UpstreamsMu.RLock()
+	currentAddrs := make(map[string]bool, len(meta.Upstreams))
+	for _, u := range meta.Upstreams {
+		currentAddrs[u.Address] = true
+	}
+	meta.UpstreamsMu.RUnlock()
+
+	discoveredAddrs := make(map[string]bool, len(discovered))
+	for _, u := range discovered {
+		discoveredAddrs[u.Address] = true
+	}
+
+	if len(currentAddrs) == len(discoveredAddrs) {
+		same := true
+		for addr := range discoveredAddrs {
+			if !currentAddrs[addr] {
+				same = false
+				break
+			}
+		}
+		if same {
+			return false
+		}
+	}
+
+	meta.UpstreamsMu.Lock()
+	meta.Upstreams = discovered
+	meta.UpstreamsMu.Unlock()
+	if err := meta.Save(); err != nil {
+		log.Printf("[reconcile-upstream] save metadata error: %v", err)
+		return false
+	}
+
+	names := make([]string, len(discovered))
+	for i, u := range discovered {
+		names[i] = u.Name
+	}
+	log.Printf("[reconcile-upstream] %s upstreams updated: %v", targetRole, names)
+	return true
 }
 
 // =============================================================================

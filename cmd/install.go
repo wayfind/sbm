@@ -292,11 +292,26 @@ func installServerNode(role internal.NodeRole, f *InstallFlags) error {
 
 	params := buildInstallParams(f, cm)
 	var cfg *internal.SBConfig
+	var socks5Port int
 	switch role {
 	case internal.RoleTransit:
 		humanPrint("Hysteria2 端口: %d\n", f.Hy2Port)
 		cfg = internal.GenerateTransitConfig(params)
 	case internal.RoleExit:
+		// Generate socks5 credentials for exit node
+		socks5Port = findAvailablePort(10000, 60000, f.VlessPort)
+		socks5User, err := internal.GenerateHexString(8)
+		if err != nil {
+			return fmt.Errorf("generate socks5 username: %w", err)
+		}
+		socks5Pass, err := internal.GeneratePassword(12)
+		if err != nil {
+			return fmt.Errorf("generate socks5 password: %w", err)
+		}
+		params.Socks5Port = socks5Port
+		params.Socks5User = socks5User
+		params.Socks5Pass = socks5Pass
+		humanPrint("SOCKS5 端口: %d\n", socks5Port)
 		cfg = internal.GenerateExitConfig(params)
 	}
 	if err := internal.SaveConfig(cfg); err != nil {
@@ -308,13 +323,19 @@ func installServerNode(role internal.NodeRole, f *InstallFlags) error {
 		return err
 	}
 
-	// Exit only has VLESS inbound (no Hy2, no ACME)
+	// Exit only has VLESS inbound + optional SOCKS5 (no Hy2, no ACME)
 	var inboundMetas []internal.InboundMeta
 	if role == internal.RoleExit {
 		inboundMetas = []internal.InboundMeta{{
 			Tag: "vless-in", Protocol: "vless", Port: f.VlessPort, Transport: "tcp",
 			PublicKey: cm.PublicKey, ShortID: cm.ShortID, UUID: cm.UUID,
 		}}
+		if socks5Port > 0 {
+			inboundMetas = append(inboundMetas, internal.InboundMeta{
+				Tag: "socks-in", Protocol: "socks", Port: socks5Port, Transport: "tcp",
+				Username: params.Socks5User, Password: params.Socks5Pass,
+			})
+		}
 	} else {
 		inboundMetas = buildBaseInboundMetas(f, cm)
 	}
@@ -337,7 +358,11 @@ func installServerNode(role internal.NodeRole, f *InstallFlags) error {
 		return fmt.Errorf("save metadata: %w", err)
 	}
 
-	if err := finishInstall(f, role); err != nil {
+	var extraPorts []int
+	if socks5Port > 0 {
+		extraPorts = append(extraPorts, socks5Port)
+	}
+	if err := finishInstall(f, role, extraPorts...); err != nil {
 		return err
 	}
 
@@ -352,6 +377,11 @@ func installServerNode(role internal.NodeRole, f *InstallFlags) error {
 	if role == internal.RoleTransit {
 		resultData["hy2_port"] = f.Hy2Port
 	}
+	if socks5Port > 0 {
+		resultData["socks5_port"] = socks5Port
+		resultData["socks5_user"] = params.Socks5User
+		resultData["socks5_pass"] = params.Socks5Pass
+	}
 
 	if internal.JSONMode {
 		internal.PrintJSON(resultData)
@@ -363,6 +393,9 @@ func installServerNode(role internal.NodeRole, f *InstallFlags) error {
 		fmt.Printf("VLESS:      %d/tcp\n", f.VlessPort)
 		if role == internal.RoleTransit {
 			fmt.Printf("Hysteria2:  %d/udp\n", f.Hy2Port)
+		}
+		if socks5Port > 0 {
+			fmt.Printf("SOCKS5:     %d/tcp (user: %s)\n", socks5Port, params.Socks5User)
 		}
 		if f.Domain != "" {
 			fmt.Printf("订阅地址:   https://%s:%d/sub/hz-office\n", f.Domain, f.SubPort)

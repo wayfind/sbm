@@ -52,6 +52,15 @@ func GeneratePassword(n int) (string, error) {
 	return base64.StdEncoding.EncodeToString(b), nil
 }
 
+// GenerateHexString returns a random hex string of n bytes (2n hex chars).
+func GenerateHexString(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
 func GenerateRandomPort(min, max int, exclude ...int) int {
 	excl := make(map[int]bool)
 	for _, p := range exclude {

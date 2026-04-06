@@ -291,6 +291,8 @@ function showInstallTab(name, el) {
 }
 
 /* === Helpers === */
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
 function ago(ts) {
   var s = Math.floor((Date.now() - new Date(ts).getTime()) / 1000);
   if (s < 0) return 'just now';
@@ -377,7 +379,13 @@ function renderTopology() {
     if (inbs.length > 0) {
       html += '<div class="node-ports">';
       for (var j = 0; j < inbs.length; j++) {
-        html += '<span class="port">' + inbs[j].protocol + ' :' + inbs[j].port + '</span>';
+        var ib = inbs[j];
+        if (ib.protocol === 'socks' && ib.username && n.domain) {
+          var socksUri = 'socks5://' + encodeURIComponent(ib.username) + ':' + encodeURIComponent(ib.password) + '@' + encodeURIComponent(n.domain) + ':' + ib.port;
+          html += '<div class="socks-link" data-uri="' + socksUri.replace(/"/g, '&quot;') + '" onclick="navigator.clipboard.writeText(this.dataset.uri);this.classList.add(\'copied\');var el=this;setTimeout(function(){el.classList.remove(\'copied\')},1500)" style="cursor:pointer;font-size:11px;word-break:break-all;margin:4px 0;padding:4px 6px;background:#1c2128;border-radius:4px;color:#7ee787"></div>';
+        } else {
+          html += '<span class="port">' + esc(ib.protocol) + ' :' + ib.port + '</span>';
+        }
       }
       html += '</div>';
     }
@@ -407,6 +415,9 @@ function renderTopology() {
   if (!colEntry.innerHTML) colEntry.innerHTML = '<div style="color:#484f58;text-align:center;padding:20px">无节点</div>';
   if (!colTransit.innerHTML) colTransit.innerHTML = '<div style="color:#484f58;text-align:center;padding:20px">无节点</div>';
   if (!colExit.innerHTML) colExit.innerHTML = '<div style="color:#484f58;text-align:center;padding:20px">无节点</div>';
+
+  // Set socks-link textContent from data-uri (safe: no innerHTML injection)
+  document.querySelectorAll('.socks-link').forEach(function(el) { el.textContent = el.dataset.uri; });
 }
 
 /* === Tab 2: Users === */
