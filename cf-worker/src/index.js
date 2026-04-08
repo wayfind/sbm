@@ -57,11 +57,13 @@ a{color:#58a6ff;text-decoration:none}
 .status-dot.disabled{background:#f85149}
 
 /* ===== Tab 1: Topology ===== */
-.topo-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:24px;align-items:start}
-.topo-col{display:flex;flex-direction:column;gap:12px}
-.topo-col-title{font-size:12px;color:#8b949e;text-transform:uppercase;letter-spacing:1px;padding-bottom:8px;border-bottom:1px solid #30363d;text-align:center;font-weight:600}
-.node{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px;transition:border-color .15s}
-.node:hover{border-color:#58a6ff}
+.topo-canvas{position:relative;min-height:600px;overflow:visible}
+.topo-svg{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:0}
+.topo-col-labels{display:flex;justify-content:space-around;margin-bottom:8px}
+.topo-col-label{font-size:12px;color:#8b949e;text-transform:uppercase;letter-spacing:1px;font-weight:600;text-align:center;flex:1}
+.node{position:absolute;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px;transition:border-color .15s,box-shadow .15s;width:260px;cursor:grab;user-select:none;z-index:1}
+.node:hover{border-color:#58a6ff;box-shadow:0 0 12px #58a6ff22}
+.node.dragging{cursor:grabbing;z-index:10;box-shadow:0 4px 24px rgba(0,0,0,.5);border-color:#58a6ff}
 .node-header{display:flex;align-items:center;gap:8px;margin-bottom:6px}
 .node-name{font-weight:600;font-size:14px}
 .node-domain{font-size:12px;color:#8b949e;font-family:monospace;margin-bottom:6px}
@@ -134,7 +136,8 @@ a{color:#58a6ff;text-decoration:none}
 
 /* Responsive */
 @media(max-width:900px){
-  .topo-grid{grid-template-columns:1fr;gap:16px}
+  .topo-canvas{min-height:800px}
+  .node{width:200px}
   .content{padding:16px}
   .header{padding:12px 16px;flex-direction:column;gap:8px}
   .nav{padding:0 12px;overflow-x:auto}
@@ -158,10 +161,13 @@ a{color:#58a6ff;text-decoration:none}
 <div class="content">
   <!-- Tab 1: Topology -->
   <div class="tab-pane active" id="pane-topology">
-    <div class="topo-grid" id="topo-grid">
-      <div class="topo-col"><div class="topo-col-title">Entry</div><div id="col-entry"></div></div>
-      <div class="topo-col"><div class="topo-col-title">Transit</div><div id="col-transit"></div></div>
-      <div class="topo-col"><div class="topo-col-title">Exit</div><div id="col-exit"></div></div>
+    <div class="topo-col-labels">
+      <div class="topo-col-label">Entry</div>
+      <div class="topo-col-label">Transit</div>
+      <div class="topo-col-label">Exit</div>
+    </div>
+    <div class="topo-canvas" id="topo-canvas">
+      <svg class="topo-svg" id="topo-svg"></svg>
     </div>
   </div>
 
@@ -351,76 +357,285 @@ function updateStatusBar() {
 }
 
 /* === Tab 1: Topology === */
-function renderTopology() {
-  var colEntry = document.getElementById('col-entry');
-  var colTransit = document.getElementById('col-transit');
-  var colExit = document.getElementById('col-exit');
-  colEntry.innerHTML = '';
-  colTransit.innerHTML = '';
-  colExit.innerHTML = '';
-  var now = Date.now();
+var nodePositions = {}; // persist positions across re-renders {node_id: {x, y}}
+var dragState = null;
 
+function renderTopology() {
+  var canvas = document.getElementById('topo-canvas');
+  var svg = document.getElementById('topo-svg');
+  // Remove old nodes but keep SVG
+  canvas.querySelectorAll('.node').forEach(function(n) { n.remove(); });
+
+  var now = Date.now();
+  var cw = canvas.offsetWidth || 1200;
+
+  // Group nodes by role
+  var groups = {entry: [], transit: [], exit: []};
   for (var i = 0; i < nodesData.length; i++) {
     var n = nodesData[i];
-    var ageMs = now - new Date(n.reported_at).getTime();
-    var isAlive = ageMs <= 20 * 60 * 1000;
-    var dotClass = isAlive ? 'dot-alive' : (ageMs <= 60 * 60 * 1000 ? 'dot-stale' : 'dot-dead');
-
-    var inbs = (n.inbounds || []).filter(function(ib) { return !ib.for_exit; });
-    var perExit = (n.inbounds || []).filter(function(ib) { return ib.for_exit; });
-
-    var html = '<div class="node">';
-    html += '<div class="node-header">';
-    html += '<span class="dot ' + dotClass + '"></span>';
-    html += '<span class="node-name">' + (n.name || n.node_id) + '</span>';
-    html += '<span class="role-badge role-' + n.role + '">' + n.role + '</span>';
-    html += '</div>';
-    if (n.domain) html += '<div class="node-domain">' + n.domain + '</div>';
-    if (inbs.length > 0) {
-      html += '<div class="node-ports">';
-      for (var j = 0; j < inbs.length; j++) {
-        var ib = inbs[j];
-        if (ib.protocol === 'socks' && ib.username && n.domain) {
-          var socksUri = 'socks5://' + encodeURIComponent(ib.username) + ':' + encodeURIComponent(ib.password) + '@' + encodeURIComponent(n.domain) + ':' + ib.port;
-          html += '<div class="socks-link" data-uri="' + socksUri.replace(/"/g, '&quot;') + '" onclick="navigator.clipboard.writeText(this.dataset.uri)" style="cursor:pointer;font-size:11px;word-break:break-all;margin:4px 0;padding:4px 6px;background:#1c2128;border-radius:4px;color:#7ee787"></div>';
-        } else {
-          html += '<span class="port">' + esc(ib.protocol) + ' :' + ib.port + '</span>';
-        }
-      }
-      html += '</div>';
-    }
-    if (perExit.length > 0) {
-      html += '<div class="node-ports">';
-      for (var k = 0; k < perExit.length; k++) {
-        html += '<span class="port port-exit">' + String.fromCharCode(8594) + ' ' + perExit[k].for_exit + ' :' + perExit[k].port + '</span>';
-      }
-      html += '</div>';
-    }
-    if (n.bwg_status) {
-      var used = n.bwg_status.data_counter || 0;
-      var plan = n.bwg_status.plan_monthly_data || 1;
-      var pct = Math.min(100, Math.round(used / plan * 100));
-      var remaining = 100 - pct;
-      var barClass = remaining > 50 ? 'ok' : (remaining > 20 ? 'warn' : 'danger');
-      html += '<div class="bwg-bar"><div class="bwg-fill ' + barClass + '" style="width:' + pct + '%"></div>';
-      html += '<span class="bwg-text">' + remaining + '% 剩余</span></div>';
-    }
-    if (n.sbm_version || n.singbox_version) {
-      html += '<div style="font-size:11px;color:#6e7681;margin-top:4px">sbm ' + esc(n.sbm_version || '?') + ' / sb ' + esc(n.singbox_version || '?') + '</div>';
-    }
-    html += '<div class="node-ts">' + ago(n.reported_at) + '</div>';
-    html += '</div>';
-
-    var target = n.role === 'entry' ? colEntry : (n.role === 'transit' ? colTransit : colExit);
-    target.innerHTML += html;
+    var role = n.role || 'exit';
+    if (groups[role]) groups[role].push(n);
   }
 
-  if (!colEntry.innerHTML) colEntry.innerHTML = '<div style="color:#484f58;text-align:center;padding:20px">无节点</div>';
-  if (!colTransit.innerHTML) colTransit.innerHTML = '<div style="color:#484f58;text-align:center;padding:20px">无节点</div>';
-  if (!colExit.innerHTML) colExit.innerHTML = '<div style="color:#484f58;text-align:center;padding:20px">无节点</div>';
+  // Column x positions (center of each column)
+  var colX = {entry: cw * 0.16, transit: cw * 0.5, exit: cw * 0.84};
+  var nodeW = 260, startY = 20, gapY = 16;
 
-  // Set socks-link textContent from data-uri (safe: no innerHTML injection)
-  document.querySelectorAll('.socks-link').forEach(function(el) { el.textContent = el.dataset.uri; });
+  // Build node elements and compute positions
+  var nodeEls = {}; // node_id → DOM element
+  var nodeData = {}; // node_id → data
+
+  function layoutColumn(nodes, cx) {
+    var y = startY;
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i];
+      var id = n.node_id;
+      nodeData[id] = n;
+      if (!nodePositions[id]) {
+        nodePositions[id] = {x: cx - nodeW / 2, y: y};
+      }
+      var el = buildNodeCard(n, now);
+      el.dataset.nodeId = id;
+      el.style.left = nodePositions[id].x + 'px';
+      el.style.top = nodePositions[id].y + 'px';
+      canvas.appendChild(el);
+      nodeEls[id] = el;
+      y += 200 + gapY; // estimate card height
+    }
+  }
+
+  layoutColumn(groups.entry, colX.entry);
+  layoutColumn(groups.transit, colX.transit);
+  layoutColumn(groups.exit, colX.exit);
+
+  // Adjust canvas height
+  var maxY = 0;
+  for (var id in nodePositions) {
+    var ny = nodePositions[id].y + 220;
+    if (ny > maxY) maxY = ny;
+  }
+  canvas.style.minHeight = Math.max(600, maxY) + 'px';
+
+  // Set socks-link textContent
+  canvas.querySelectorAll('.socks-link').forEach(function(el) { el.textContent = el.dataset.uri; });
+
+  // After DOM layout, re-read actual heights for accurate connection drawing
+  requestAnimationFrame(function() {
+    // Update canvas height based on actual card sizes
+    var realMaxY = 0;
+    for (var nid in nodeEls) {
+      var el = nodeEls[nid];
+      var bottom = el.offsetTop + el.offsetHeight;
+      if (bottom > realMaxY) realMaxY = bottom;
+    }
+    canvas.style.minHeight = Math.max(600, realMaxY + 40) + 'px';
+    drawConnections(svg, nodeEls, nodeData, canvas);
+  });
+
+  // Drag setup
+  setupDrag(canvas, svg, nodeEls, nodeData);
+}
+
+function buildNodeCard(n, now) {
+  var ageMs = now - new Date(n.reported_at).getTime();
+  var isAlive = ageMs <= 20 * 60 * 1000;
+  var dotClass = isAlive ? 'dot-alive' : (ageMs <= 60 * 60 * 1000 ? 'dot-stale' : 'dot-dead');
+
+  var inbs = (n.inbounds || []).filter(function(ib) { return !ib.for_exit; });
+  var perExit = (n.inbounds || []).filter(function(ib) { return ib.for_exit; });
+
+  var html = '<div class="node-header">';
+  html += '<span class="dot ' + dotClass + '"></span>';
+  html += '<span class="node-name">' + esc(n.name || n.node_id) + '</span>';
+  html += '<span class="role-badge role-' + n.role + '">' + esc(n.role) + '</span>';
+  html += '</div>';
+  if (n.domain) html += '<div class="node-domain">' + esc(n.domain) + '</div>';
+  if (inbs.length > 0) {
+    html += '<div class="node-ports">';
+    for (var j = 0; j < inbs.length; j++) {
+      var ib = inbs[j];
+      if (ib.protocol === 'socks' && ib.username && n.domain) {
+        var socksUri = 'socks5://' + encodeURIComponent(ib.username) + ':' + encodeURIComponent(ib.password) + '@' + encodeURIComponent(n.domain) + ':' + ib.port;
+        html += '<div class="socks-link" data-uri="' + socksUri.replace(/"/g, '&quot;') + '" onclick="event.stopPropagation();navigator.clipboard.writeText(this.dataset.uri)" style="cursor:pointer;font-size:11px;word-break:break-all;margin:4px 0;padding:4px 6px;background:#1c2128;border-radius:4px;color:#7ee787"></div>';
+      } else {
+        html += '<span class="port">' + esc(ib.protocol) + ' :' + ib.port + '</span>';
+      }
+    }
+    html += '</div>';
+  }
+  if (perExit.length > 0) {
+    html += '<div class="node-ports">';
+    for (var k = 0; k < perExit.length; k++) {
+      html += '<span class="port port-exit">' + String.fromCharCode(8594) + ' ' + esc(perExit[k].for_exit) + ' :' + perExit[k].port + '</span>';
+    }
+    html += '</div>';
+  }
+  if (n.bwg_status) {
+    var used = n.bwg_status.data_counter || 0;
+    var plan = n.bwg_status.plan_monthly_data || 1;
+    var pct = Math.min(100, Math.round(used / plan * 100));
+    var remaining = 100 - pct;
+    var barClass = remaining > 50 ? 'ok' : (remaining > 20 ? 'warn' : 'danger');
+    html += '<div class="bwg-bar"><div class="bwg-fill ' + barClass + '" style="width:' + pct + '%"></div>';
+    html += '<span class="bwg-text">' + remaining + '% 剩余</span></div>';
+  }
+  if (n.sbm_version || n.singbox_version) {
+    html += '<div style="font-size:11px;color:#6e7681;margin-top:4px">sbm ' + esc(n.sbm_version || '?') + ' / sb ' + esc(n.singbox_version || '?') + '</div>';
+  }
+  html += '<div class="node-ts">' + ago(n.reported_at) + '</div>';
+
+  var div = document.createElement('div');
+  div.className = 'node';
+  div.innerHTML = html;
+  return div;
+}
+
+function drawConnections(svg, nodeEls, nodeData, canvas) {
+  svg.innerHTML = '';
+  svg.setAttribute('width', canvas.offsetWidth);
+  svg.setAttribute('height', canvas.offsetHeight);
+
+  // Defs for glow effect
+  var defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
+  var filter = document.createElementNS('http://www.w3.org/2000/svg', 'filter');
+  filter.setAttribute('id', 'glow');
+  var blur = document.createElementNS('http://www.w3.org/2000/svg', 'feGaussianBlur');
+  blur.setAttribute('stdDeviation', '2');
+  blur.setAttribute('result', 'glow');
+  filter.appendChild(blur);
+  var merge = document.createElementNS('http://www.w3.org/2000/svg', 'feMerge');
+  var m1 = document.createElementNS('http://www.w3.org/2000/svg', 'feMergeNode');
+  m1.setAttribute('in', 'glow');
+  merge.appendChild(m1);
+  var m2 = document.createElementNS('http://www.w3.org/2000/svg', 'feMergeNode');
+  m2.setAttribute('in', 'SourceGraphic');
+  merge.appendChild(m2);
+  filter.appendChild(merge);
+  defs.appendChild(filter);
+  svg.appendChild(defs);
+
+  // Build name→id map
+  var nameToId = {};
+  for (var id in nodeData) nameToId[nodeData[id].name] = id;
+
+  // Draw connections: transit per-exit → exit
+  for (var tid in nodeData) {
+    var tn = nodeData[tid];
+    if (tn.role !== 'transit') continue;
+    var perExits = (tn.inbounds || []).filter(function(ib) { return ib.for_exit; });
+    for (var i = 0; i < perExits.length; i++) {
+      var exitId = nameToId[perExits[i].for_exit];
+      if (exitId && nodeEls[tid] && nodeEls[exitId]) {
+        drawEdge(svg, nodeEls[tid], nodeEls[exitId], '#f0883e', isNodeAlive(tn));
+      }
+    }
+    // Draw connections: entry → transit (all entries connect to all transits in this topology)
+    for (var eid in nodeData) {
+      if (nodeData[eid].role === 'entry' && nodeEls[eid] && nodeEls[tid]) {
+        drawEdge(svg, nodeEls[eid], nodeEls[tid], '#58a6ff', isNodeAlive(tn));
+      }
+    }
+  }
+}
+
+function isNodeAlive(n) {
+  return (Date.now() - new Date(n.reported_at).getTime()) <= 20 * 60 * 1000;
+}
+
+function drawEdge(svg, fromEl, toEl, color, alive) {
+  var x1 = fromEl.offsetLeft + fromEl.offsetWidth;
+  var y1 = fromEl.offsetTop + fromEl.offsetHeight / 2;
+  var x2 = toEl.offsetLeft;
+  var y2 = toEl.offsetTop + toEl.offsetHeight / 2;
+  var dx = Math.abs(x2 - x1) * 0.4;
+
+  var path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('d', 'M' + x1 + ',' + y1 + ' C' + (x1 + dx) + ',' + y1 + ' ' + (x2 - dx) + ',' + y2 + ' ' + x2 + ',' + y2);
+  path.setAttribute('fill', 'none');
+  path.setAttribute('stroke', color);
+  path.setAttribute('stroke-width', alive ? '1.5' : '1');
+  path.setAttribute('opacity', alive ? '0.6' : '0.2');
+  if (!alive) path.setAttribute('stroke-dasharray', '6,4');
+  path.setAttribute('filter', alive ? 'url(#glow)' : '');
+  svg.appendChild(path);
+
+  // Animated dot for alive connections
+  if (alive) {
+    var circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+    circle.setAttribute('r', '2.5');
+    circle.setAttribute('fill', color);
+    circle.setAttribute('opacity', '0.8');
+    var anim = document.createElementNS('http://www.w3.org/2000/svg', 'animateMotion');
+    anim.setAttribute('dur', '3s');
+    anim.setAttribute('repeatCount', 'indefinite');
+    anim.setAttribute('path', path.getAttribute('d'));
+    circle.appendChild(anim);
+    svg.appendChild(circle);
+  }
+}
+
+function setupDrag(canvas, svg, nodeEls, nodeData) {
+  canvas.onmousedown = function(e) {
+    var node = e.target.closest('.node');
+    if (!node || e.target.closest('.socks-link')) return;
+    e.preventDefault();
+    var id = node.dataset.nodeId;
+    node.classList.add('dragging');
+    dragState = {
+      id: id, el: node,
+      startX: e.clientX, startY: e.clientY,
+      origX: parseInt(node.style.left), origY: parseInt(node.style.top)
+    };
+  };
+  document.onmousemove = function(e) {
+    if (!dragState) return;
+    var dx = e.clientX - dragState.startX;
+    var dy = e.clientY - dragState.startY;
+    var nx = dragState.origX + dx;
+    var ny = dragState.origY + dy;
+    dragState.el.style.left = nx + 'px';
+    dragState.el.style.top = ny + 'px';
+    nodePositions[dragState.id] = {x: nx, y: ny};
+    drawConnections(svg, nodeEls, nodeData, canvas);
+  };
+  document.onmouseup = function() {
+    if (dragState) {
+      dragState.el.classList.remove('dragging');
+      dragState = null;
+    }
+  };
+  // Touch support
+  canvas.ontouchstart = function(e) {
+    var node = e.target.closest('.node');
+    if (!node || e.target.closest('.socks-link')) return;
+    var t = e.touches[0];
+    var id = node.dataset.nodeId;
+    node.classList.add('dragging');
+    dragState = {
+      id: id, el: node,
+      startX: t.clientX, startY: t.clientY,
+      origX: parseInt(node.style.left), origY: parseInt(node.style.top)
+    };
+  };
+  document.ontouchmove = function(e) {
+    if (!dragState) return;
+    e.preventDefault();
+    var t = e.touches[0];
+    var dx = t.clientX - dragState.startX;
+    var dy = t.clientY - dragState.startY;
+    var nx = dragState.origX + dx;
+    var ny = dragState.origY + dy;
+    dragState.el.style.left = nx + 'px';
+    dragState.el.style.top = ny + 'px';
+    nodePositions[dragState.id] = {x: nx, y: ny};
+    drawConnections(svg, nodeEls, nodeData, canvas);
+  };
+  document.ontouchend = function() {
+    if (dragState) {
+      dragState.el.classList.remove('dragging');
+      dragState = null;
+    }
+  };
 }
 
 /* === Tab 2: Users === */
