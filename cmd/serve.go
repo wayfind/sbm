@@ -95,7 +95,7 @@ func RunServe(args []string) error {
 			log.Printf("[traffic] quota exceeded, disabling users %v → reconcile now", disabled)
 			// Trigger immediate reconcile: rebuild config without disabled users + restart sing-box
 			downstreams := topoStore.GetDownstreams()
-			if err := internal.ReconcileEntryConfig(meta, downstreams, usersDB); err != nil {
+			if err := internal.ReconcileEntryConfig(meta, downstreams, usersDB, true); err != nil {
 				log.Printf("[traffic] reconcile after quota disable failed: %v", err)
 			}
 		})

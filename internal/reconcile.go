@@ -27,15 +27,15 @@ func StartReconcileLoop(meta *Metadata, store *TopoStore, cfClient *CFTopoClient
 	switch meta.Role {
 	case RoleEntry:
 		reconcileFunc = func() {
-			downstreams := getTopoFromDualView(meta, store, cfClient)
-			if err := ReconcileEntryConfig(meta, downstreams, db); err != nil {
+			downstreams, degraded := getTopoFromDualView(meta, store, cfClient)
+			if err := ReconcileEntryConfig(meta, downstreams, db, degraded); err != nil {
 				log.Printf("[reconcile] error: %v", err)
 			}
 		}
 	case RoleTransit:
 		reconcileFunc = func() {
 			ReconcileUpstreams(meta, cfClient)
-			downstreams := getTopoFromDualView(meta, store, cfClient)
+			downstreams, _ := getTopoFromDualView(meta, store, cfClient)
 			if err := ReconcileTransitConfig(meta, downstreams); err != nil {
 				log.Printf("[reconcile] error: %v", err)
 			}
@@ -62,17 +62,19 @@ func StartReconcileLoop(meta *Metadata, store *TopoStore, cfClient *CFTopoClient
 }
 
 // getTopoFromDualView reads topology from CF (primary) and local store (fallback).
-func getTopoFromDualView(meta *Metadata, store *TopoStore, cfClient *CFTopoClient) []TopologyTree {
+// Returns downstreams and whether the view is degraded (CF unavailable, local-only).
+// Callers should avoid destructive changes (removing exits/ports) on degraded views.
+func getTopoFromDualView(meta *Metadata, store *TopoStore, cfClient *CFTopoClient) ([]TopologyTree, bool) {
 	localDownstreams := store.GetDownstreams()
 
 	if cfClient == nil {
-		return localDownstreams
+		return localDownstreams, true
 	}
 
 	cfNodes, err := cfClient.GetAllNodes()
 	if err != nil {
 		log.Printf("[reconcile] CF unavailable, using local view: %v", err)
-		return localDownstreams
+		return localDownstreams, true
 	}
 
 	cfDownstreams := cfNodesToDownstreams(cfNodes, meta)
@@ -110,7 +112,7 @@ func getTopoFromDualView(meta *Metadata, store *TopoStore, cfClient *CFTopoClien
 		}
 	}
 
-	return cfDownstreams
+	return cfDownstreams, false
 }
 
 // cfNodesToDownstreams converts flat CF node list into topology trees for Entry.
@@ -147,7 +149,7 @@ func cfNodesToDownstreams(nodes []NodeInfo, meta *Metadata) []TopologyTree {
 // Entry reconcile — transit outbounds + exit outbounds (detour) + per-exit SOCKS5
 // =============================================================================
 
-func ReconcileEntryConfig(meta *Metadata, downstreams []TopologyTree, db *sql.DB) error {
+func ReconcileEntryConfig(meta *Metadata, downstreams []TopologyTree, db *sql.DB, degraded bool) error {
 	if len(downstreams) == 0 {
 		return nil
 	}
@@ -173,7 +175,8 @@ func ReconcileEntryConfig(meta *Metadata, downstreams []TopologyTree, db *sql.DB
 	}
 
 	// Assign per-exit SOCKS5 ports (localhost, for application-layer routing)
-	portsChanged := assignExitPorts(meta, desiredExits)
+	// On degraded view (CF unavailable), only add new exits — never remove existing ones.
+	portsChanged := assignExitPorts(meta, desiredExits, degraded)
 
 	ConfigMu.Lock()
 	defer ConfigMu.Unlock()
@@ -185,6 +188,16 @@ func ReconcileEntryConfig(meta *Metadata, downstreams []TopologyTree, db *sql.DB
 
 	usersChanged := desiredUsers != nil && inboundUsersNeedUpdate(data, desiredUsers)
 	versionChanged := meta.SBMVersion != Version
+
+	// On degraded view, skip if we see fewer nodes than current config —
+	// this prevents oscillation when CF is temporarily unavailable.
+	if degraded {
+		configNeedsUpdate := entryConfigNeedsUpdate(data, desiredTransits, desiredExits, meta)
+		if configNeedsUpdate && !versionChanged && !usersChanged {
+			log.Printf("[reconcile] degraded view (%d transits, %d exits), skipping config change", len(desiredTransits), len(desiredExits))
+			return nil
+		}
+	}
 
 	if !entryConfigNeedsUpdate(data, desiredTransits, desiredExits, meta) && !portsChanged && !usersChanged && !versionChanged {
 		return nil
@@ -521,7 +534,7 @@ func pickBestInbound(node NodeInfo) *TransitInfo {
 // Per-exit SOCKS5 port management (Entry localhost, for application routing)
 // =============================================================================
 
-func assignExitPorts(meta *Metadata, exits []ExitInfo) bool {
+func assignExitPorts(meta *Metadata, exits []ExitInfo, degraded bool) bool {
 	if meta.ExitSocksPorts == nil {
 		meta.ExitSocksPorts = make(map[string]int)
 	}
@@ -552,24 +565,28 @@ func assignExitPorts(meta *Metadata, exits []ExitInfo) bool {
 			log.Printf("[reconcile] assigned hy2 port %d for exit %s", port, e.Name)
 		}
 	}
-	activeExits := map[string]bool{}
-	for _, e := range exits {
-		activeExits[e.Name] = true
-	}
-	for name := range meta.ExitSocksPorts {
-		if !activeExits[name] {
-			// Close firewall ports for removed exit
-			if port, ok := meta.ExitVlessPorts[name]; ok {
-				FirewallRemovePort(port, "tcp")
+	// Only remove exits on authoritative (non-degraded) view.
+	// Degraded view (CF timeout, local-only) may be incomplete — removing exits
+	// would cause port churn and unnecessary sing-box restarts when CF recovers.
+	if !degraded {
+		activeExits := map[string]bool{}
+		for _, e := range exits {
+			activeExits[e.Name] = true
+		}
+		for name := range meta.ExitSocksPorts {
+			if !activeExits[name] {
+				if port, ok := meta.ExitVlessPorts[name]; ok {
+					FirewallRemovePort(port, "tcp")
+				}
+				if port, ok := meta.ExitHy2Ports[name]; ok {
+					FirewallRemovePort(port, "udp")
+				}
+				delete(meta.ExitSocksPorts, name)
+				delete(meta.ExitVlessPorts, name)
+				delete(meta.ExitHy2Ports, name)
+				changed = true
+				log.Printf("[reconcile] removed ports for exit %s", name)
 			}
-			if port, ok := meta.ExitHy2Ports[name]; ok {
-				FirewallRemovePort(port, "udp")
-			}
-			delete(meta.ExitSocksPorts, name)
-			delete(meta.ExitVlessPorts, name)
-			delete(meta.ExitHy2Ports, name)
-			changed = true
-			log.Printf("[reconcile] removed ports for exit %s", name)
 		}
 	}
 	return changed
