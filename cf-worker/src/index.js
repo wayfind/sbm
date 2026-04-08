@@ -359,8 +359,12 @@ function updateStatusBar() {
 /* === Tab 1: Topology === */
 var nodePositions = {}; // persist positions across re-renders {node_id: {x, y}}
 var dragState = null;
+var dragSetupDone = false;
+var currentNodeEls = {};  // shared ref updated each render
+var currentNodeData = {};
 
 function renderTopology() {
+  if (dragState) return; // don't re-render while dragging
   var canvas = document.getElementById('topo-canvas');
   var svg = document.getElementById('topo-svg');
   // Remove old nodes but keep SVG
@@ -408,6 +412,10 @@ function renderTopology() {
   layoutColumn(groups.transit, colX.transit);
   layoutColumn(groups.exit, colX.exit);
 
+  // Update shared refs for drag handlers
+  currentNodeEls = nodeEls;
+  currentNodeData = nodeData;
+
   // Adjust canvas height
   var maxY = 0;
   for (var id in nodePositions) {
@@ -419,8 +427,27 @@ function renderTopology() {
   // Set socks-link textContent
   canvas.querySelectorAll('.socks-link').forEach(function(el) { el.textContent = el.dataset.uri; });
 
-  // After DOM layout, re-read actual heights for accurate connection drawing
+  // After DOM layout, re-read actual heights and fix overlapping cards
   requestAnimationFrame(function() {
+    // Re-layout columns if cards overlap (only for cards not yet dragged by user)
+    var roles = ['entry', 'transit', 'exit'];
+    for (var ri = 0; ri < roles.length; ri++) {
+      var colNodes = [];
+      for (var nid in nodeEls) {
+        if (nodeData[nid] && nodeData[nid].role === roles[ri]) colNodes.push(nid);
+      }
+      // Sort by current y position
+      colNodes.sort(function(a, b) { return nodePositions[a].y - nodePositions[b].y; });
+      for (var ci = 1; ci < colNodes.length; ci++) {
+        var prevEl = nodeEls[colNodes[ci - 1]];
+        var curId = colNodes[ci];
+        var prevBottom = prevEl.offsetTop + prevEl.offsetHeight + gapY;
+        if (nodePositions[curId].y < prevBottom) {
+          nodePositions[curId].y = prevBottom;
+          nodeEls[curId].style.top = prevBottom + 'px';
+        }
+      }
+    }
     // Update canvas height based on actual card sizes
     var realMaxY = 0;
     for (var nid in nodeEls) {
@@ -432,8 +459,11 @@ function renderTopology() {
     drawConnections(svg, nodeEls, nodeData, canvas);
   });
 
-  // Drag setup
-  setupDrag(canvas, svg, nodeEls, nodeData);
+  // Drag setup — bind once, handlers read currentNodeEls/currentNodeData
+  if (!dragSetupDone) {
+    setupDrag(canvas, svg);
+    dragSetupDone = true;
+  }
 }
 
 function buildNodeCard(n, now) {
@@ -574,7 +604,17 @@ function drawEdge(svg, fromEl, toEl, color, alive) {
   }
 }
 
-function setupDrag(canvas, svg, nodeEls, nodeData) {
+function setupDrag(canvas, svg) {
+  var rafPending = false;
+  function redrawThrottled() {
+    if (rafPending) return;
+    rafPending = true;
+    requestAnimationFrame(function() {
+      rafPending = false;
+      drawConnections(svg, currentNodeEls, currentNodeData, canvas);
+    });
+  }
+
   canvas.onmousedown = function(e) {
     var node = e.target.closest('.node');
     if (!node || e.target.closest('.socks-link')) return;
@@ -589,14 +629,12 @@ function setupDrag(canvas, svg, nodeEls, nodeData) {
   };
   document.onmousemove = function(e) {
     if (!dragState) return;
-    var dx = e.clientX - dragState.startX;
-    var dy = e.clientY - dragState.startY;
-    var nx = dragState.origX + dx;
-    var ny = dragState.origY + dy;
+    var nx = dragState.origX + e.clientX - dragState.startX;
+    var ny = dragState.origY + e.clientY - dragState.startY;
     dragState.el.style.left = nx + 'px';
     dragState.el.style.top = ny + 'px';
     nodePositions[dragState.id] = {x: nx, y: ny};
-    drawConnections(svg, nodeEls, nodeData, canvas);
+    redrawThrottled();
   };
   document.onmouseup = function() {
     if (dragState) {
@@ -621,14 +659,12 @@ function setupDrag(canvas, svg, nodeEls, nodeData) {
     if (!dragState) return;
     e.preventDefault();
     var t = e.touches[0];
-    var dx = t.clientX - dragState.startX;
-    var dy = t.clientY - dragState.startY;
-    var nx = dragState.origX + dx;
-    var ny = dragState.origY + dy;
+    var nx = dragState.origX + t.clientX - dragState.startX;
+    var ny = dragState.origY + t.clientY - dragState.startY;
     dragState.el.style.left = nx + 'px';
     dragState.el.style.top = ny + 'px';
     nodePositions[dragState.id] = {x: nx, y: ny};
-    drawConnections(svg, nodeEls, nodeData, canvas);
+    redrawThrottled();
   };
   document.ontouchend = function() {
     if (dragState) {
