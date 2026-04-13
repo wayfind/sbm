@@ -219,7 +219,18 @@ func BuildTopologyTree(meta *Metadata, store *TopoStore) TopologyTree {
 		Self: BuildNodeInfo(meta),
 	}
 	if store != nil {
-		tree.Downstreams = store.GetDownstreams()
+		// Cycle defense: dedupe by NodeID, prune nested Downstreams.
+		// Chain protocol is Self-only since v2.9.4 — but old store data or
+		// peers running v2.9.3 may still contain nested trees. Strip them here.
+		seen := map[string]bool{tree.Self.NodeID: true}
+		for _, d := range store.GetDownstreams() {
+			if seen[d.Self.NodeID] {
+				continue
+			}
+			seen[d.Self.NodeID] = true
+			d.Downstreams = nil
+			tree.Downstreams = append(tree.Downstreams, d)
+		}
 	}
 	return tree
 }
@@ -287,20 +298,30 @@ func HandleReport(store *TopoStore) http.HandlerFunc {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20)) // 1MB limit
+		// 8MB hard limit (peers should send <100KB Self-only payloads; this is purely
+		// a safety net against accidental cycle bugs or malicious clients).
+		const maxReportSize = 8 << 20
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxReportSize+1))
 		if err != nil {
 			http.Error(w, "read error", http.StatusBadRequest)
 			return
 		}
+		if len(body) > maxReportSize {
+			http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		var tree TopologyTree
 		if err := json.Unmarshal(body, &tree); err != nil {
-			http.Error(w, "invalid json", http.StatusBadRequest)
+			http.Error(w, "invalid json: "+err.Error(), http.StatusBadRequest)
 			return
 		}
 		if tree.Self.NodeID == "" {
 			http.Error(w, "missing node_id", http.StatusBadRequest)
 			return
 		}
+		// Drop downstreams from chain reports — chain protocol is Self-only to avoid
+		// recursive payload growth. CF (/nodes) provides full-network view.
+		tree.Downstreams = nil
 		// Auto-fill address from RemoteAddr if node didn't provide one
 		if tree.Self.Address == "" && tree.Self.Domain == "" {
 			host, _, _ := net.SplitHostPort(r.RemoteAddr)
@@ -373,22 +394,35 @@ func doReport(meta *Metadata, store *TopoStore, cfClient *CFTopoClient, chainCli
 		}
 	}
 
-	// Channel B: Chain /report to upstreams (full tree)
+	// Channel B: Chain /report to upstreams (Self only, see reportToUpstreams)
 	if chainClient != nil {
 		meta.UpstreamsMu.RLock()
 		hasUpstreams := len(meta.Upstreams) > 0
 		meta.UpstreamsMu.RUnlock()
 		if hasUpstreams {
-			reportToUpstreams(meta, store, chainClient)
+			reportToUpstreams(meta, chainClient)
 		}
 	}
 }
 
-func reportToUpstreams(meta *Metadata, store *TopoStore, client *http.Client) {
-	tree := BuildTopologyTree(meta, store)
+func reportToUpstreams(meta *Metadata, client *http.Client) {
+	// Chain reporter sends only this node's Self info — NOT the downstreams tree.
+	// Why: each upstream's HandleReport stores the received tree by NodeID. If we
+	// included Downstreams, the next round-trip would embed the upstream's view of
+	// us (which already contains our previous report), causing exponential payload
+	// growth (cycle: A→B→A→B...). The full-network view is provided by CF (/nodes),
+	// not chain. Chain is for liveness + per-node metadata only.
+	tree := TopologyTree{Self: BuildNodeInfo(meta)}
 	data, err := json.Marshal(tree)
 	if err != nil {
 		log.Printf("[topology] marshal error: %v", err)
+		return
+	}
+	if len(data) > 256*1024 {
+		log.Printf("[topology] WARN: report payload size=%d exceeds 256KB threshold", len(data))
+	}
+	if len(data) > 768*1024 {
+		log.Printf("[topology] ERROR: report payload size=%d exceeds 768KB hard limit, refusing to send", len(data))
 		return
 	}
 
@@ -419,10 +453,16 @@ func reportToUpstreams(meta *Metadata, store *TopoStore, client *http.Client) {
 			log.Printf("[topology] report to %s error: %v", upstream.Name, err)
 			continue
 		}
+		// Always read body — entry returns helpful messages for non-200 (invalid json, missing node_id, ...)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			log.Printf("[topology] report to %s returned %d", upstream.Name, resp.StatusCode)
+			snippet := strings.TrimSpace(string(respBody))
+			if len(snippet) > 200 {
+				snippet = snippet[:200]
+			}
+			log.Printf("[topology] report to %s returned %d: %s", upstream.Name, resp.StatusCode, snippet)
 		}
 	}
 }
