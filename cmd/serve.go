@@ -162,16 +162,22 @@ func stripServerHeader(next http.Handler) http.Handler {
 	})
 }
 
-// findCertFiles returns cert/key paths, preferring certbot over sing-box ACME.
+// findCertFiles returns cert/key paths, checking multiple locations.
 func findCertFiles(domain string) (certFile, keyFile string) {
 	if domain != "" {
-		// Certbot path
-		cb := "/etc/letsencrypt/live/" + domain
-		if _, err := os.Stat(cb + "/fullchain.pem"); err == nil {
-			return cb + "/fullchain.pem", cb + "/privkey.pem"
+		candidates := []struct{ cert, key string }{
+			// Certbot
+			{"/etc/letsencrypt/live/" + domain + "/fullchain.pem", "/etc/letsencrypt/live/" + domain + "/privkey.pem"},
+			// Pre-installed (sbm install / manual)
+			{"/root/cert/" + domain + "/fullchain.pem", "/root/cert/" + domain + "/privkey.pem"},
+		}
+		for _, c := range candidates {
+			if _, err := os.Stat(c.cert); err == nil {
+				return c.cert, c.key
+			}
 		}
 	}
-	// Sing-box ACME path
+	// Sing-box ACME path (certmagic)
 	return internal.CertPath(domain), internal.CertKeyPath(domain)
 }
 

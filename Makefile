@@ -36,10 +36,7 @@ deploy: build
 
 # Deploy sbm to all nodes
 deploy-all: build
-	@for host in root@67.230.165.100 david@175.27.169.180; do \
-	  echo "deploying to $$host..."; \
-	  scp sbm $$host:~/sbm && echo "  done" || echo "  failed"; \
-	done
+	bash scripts/deploy-all.sh --skip-build
 
 clean:
 	rm -f sbm sing-box-linux-amd64

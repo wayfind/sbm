@@ -79,34 +79,38 @@ func getTopoFromDualView(meta *Metadata, store *TopoStore, cfClient *CFTopoClien
 
 	cfDownstreams := cfNodesToDownstreams(cfNodes, meta)
 
-	// Consistency check: only warn about nodes that should be reachable via chain
-	// (i.e., configured as upstreams) but aren't. CF-only nodes are expected —
-	// that's the whole point of CF as a discovery supplement.
-	if len(meta.Upstreams) > 0 {
-		localIDs := map[string]bool{}
-		for _, d := range localDownstreams {
-			localIDs[d.Self.NodeID] = true
+	// Consistency check between chain and CF control planes.
+	// Only meaningful for Entry: Entry has concrete upstreams whose absence in CF
+	// signals a real control-plane break. Transit's local store mixes exits and
+	// entries (anyone can POST /report) while cfNodesToDownstreams filters to
+	// transit+exit only — comparing them directly produces false positives.
+	if meta.Role == RoleEntry && len(meta.Upstreams) > 0 {
+		cfIDs := map[string]bool{}
+		for _, n := range cfNodes {
+			cfIDs[n.NodeID] = true
 		}
-		// Build upstream address set for matching
 		upstreamAddrs := map[string]bool{}
 		for _, u := range meta.Upstreams {
 			upstreamAddrs[u.Address] = true
 		}
-		for _, d := range cfDownstreams {
-			if !localIDs[d.Self.NodeID] && upstreamAddrs[d.Self.Address] {
+		// ALERT: a configured upstream (transit) surfaces in CF but never reached us
+		// through chain → data-plane break between this entry and that transit.
+		localIDs := map[string]bool{}
+		for _, d := range localDownstreams {
+			localIDs[d.Self.NodeID] = true
+		}
+		for _, n := range cfNodes {
+			if n.NodeID == meta.NodeID {
+				continue
+			}
+			if upstreamAddrs[n.Address] && !localIDs[n.NodeID] {
 				log.Printf("[reconcile] ALERT: upstream %s (%s) in CF but not in chain → data-plane break?",
-					d.Self.Name, d.Self.Address)
+					n.Name, n.Address)
 			}
 		}
+		// WARN: chain reports a node that CF has no record of → CF channel issue.
 		for _, d := range localDownstreams {
-			found := false
-			for _, cd := range cfDownstreams {
-				if cd.Self.NodeID == d.Self.NodeID {
-					found = true
-					break
-				}
-			}
-			if !found {
+			if !cfIDs[d.Self.NodeID] {
 				log.Printf("[reconcile] WARN: node %s in chain but not in CF → CF channel issue?", d.Self.Name)
 			}
 		}
@@ -162,21 +166,26 @@ func ReconcileEntryConfig(meta *Metadata, downstreams []TopologyTree, db *sql.DB
 		return nil
 	}
 
+	// On degraded view (CF unavailable), skip entirely. Degraded topology may be
+	// incomplete — applying it causes oscillation. All updates (topo, users, version)
+	// can safely wait until CF recovers (typically minutes).
+	if degraded {
+		log.Printf("[reconcile] degraded view (%d transits, %d exits), skipping", len(desiredTransits), len(desiredExits))
+		return nil
+	}
+
 	// Load users from SQLite for inbound user sync
 	var desiredUsers []User
 	if db != nil {
 		users, err := GetEnabledUsers(db)
 		if err != nil {
 			log.Printf("[reconcile] WARNING: failed to load users from DB, preserving existing: %v", err)
-			// DB error → don't touch users (fail-safe)
 		} else {
 			desiredUsers = users
 		}
 	}
 
-	// Assign per-exit SOCKS5 ports (localhost, for application-layer routing)
-	// On degraded view (CF unavailable), only add new exits — never remove existing ones.
-	portsChanged := assignExitPorts(meta, desiredExits, degraded)
+	portsChanged := assignExitPorts(meta, desiredExits)
 
 	ConfigMu.Lock()
 	defer ConfigMu.Unlock()
@@ -188,16 +197,6 @@ func ReconcileEntryConfig(meta *Metadata, downstreams []TopologyTree, db *sql.DB
 
 	usersChanged := desiredUsers != nil && inboundUsersNeedUpdate(data, desiredUsers)
 	versionChanged := meta.SBMVersion != Version
-
-	// On degraded view, skip if we see fewer nodes than current config —
-	// this prevents oscillation when CF is temporarily unavailable.
-	if degraded {
-		configNeedsUpdate := entryConfigNeedsUpdate(data, desiredTransits, desiredExits, meta)
-		if configNeedsUpdate && !versionChanged && !usersChanged {
-			log.Printf("[reconcile] degraded view (%d transits, %d exits), skipping config change", len(desiredTransits), len(desiredExits))
-			return nil
-		}
-	}
 
 	if !entryConfigNeedsUpdate(data, desiredTransits, desiredExits, meta) && !portsChanged && !usersChanged && !versionChanged {
 		return nil
@@ -534,7 +533,7 @@ func pickBestInbound(node NodeInfo) *TransitInfo {
 // Per-exit SOCKS5 port management (Entry localhost, for application routing)
 // =============================================================================
 
-func assignExitPorts(meta *Metadata, exits []ExitInfo, degraded bool) bool {
+func assignExitPorts(meta *Metadata, exits []ExitInfo) bool {
 	if meta.ExitSocksPorts == nil {
 		meta.ExitSocksPorts = make(map[string]int)
 	}
@@ -565,28 +564,24 @@ func assignExitPorts(meta *Metadata, exits []ExitInfo, degraded bool) bool {
 			log.Printf("[reconcile] assigned hy2 port %d for exit %s", port, e.Name)
 		}
 	}
-	// Only remove exits on authoritative (non-degraded) view.
-	// Degraded view (CF timeout, local-only) may be incomplete — removing exits
-	// would cause port churn and unnecessary sing-box restarts when CF recovers.
-	if !degraded {
-		activeExits := map[string]bool{}
-		for _, e := range exits {
-			activeExits[e.Name] = true
-		}
-		for name := range meta.ExitSocksPorts {
-			if !activeExits[name] {
-				if port, ok := meta.ExitVlessPorts[name]; ok {
-					FirewallRemovePort(port, "tcp")
-				}
-				if port, ok := meta.ExitHy2Ports[name]; ok {
-					FirewallRemovePort(port, "udp")
-				}
-				delete(meta.ExitSocksPorts, name)
-				delete(meta.ExitVlessPorts, name)
-				delete(meta.ExitHy2Ports, name)
-				changed = true
-				log.Printf("[reconcile] removed ports for exit %s", name)
+	// Remove ports for exits no longer in topology
+	activeExits := map[string]bool{}
+	for _, e := range exits {
+		activeExits[e.Name] = true
+	}
+	for name := range meta.ExitSocksPorts {
+		if !activeExits[name] {
+			if port, ok := meta.ExitVlessPorts[name]; ok {
+				FirewallRemovePort(port, "tcp")
 			}
+			if port, ok := meta.ExitHy2Ports[name]; ok {
+				FirewallRemovePort(port, "udp")
+			}
+			delete(meta.ExitSocksPorts, name)
+			delete(meta.ExitVlessPorts, name)
+			delete(meta.ExitHy2Ports, name)
+			changed = true
+			log.Printf("[reconcile] removed ports for exit %s", name)
 		}
 	}
 	return changed
