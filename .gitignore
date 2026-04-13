@@ -1,3 +1,8 @@
 sbm
 cf-worker/.wrangler/
 sing-box-linux-amd64
+
+# Claude Code — 项目级 skill 入库，本地状态忽略
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+sbm-inspect.skill

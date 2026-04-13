@@ -1,0 +1,297 @@
+#!/bin/bash
+# sbm 全节点巡检脚本
+#
+# Usage: scripts/inspect.sh [--since MINUTES]
+#
+# 输出：节点健康表 + CF 注册表 + 异常摘要（markdown，给 Claude 读）
+#
+# 采集维度：
+#   1. 基础健康  systemd active + NRestarts + sbm/sing-box 版本
+#   2. 告警计数  sbm-server WARN/ALERT/ERR + sing-box FATAL/panic（最近 N 分钟）
+#   3. 证书      days_remaining（sbm --json cert）
+#   4. BWG 带宽  transit 节点剩余 %（sbm --json bwg status）
+#   5. 用户活跃  entry 节点 enabled 用户数（sbm --json user list）
+#   6. CF 控制面 tun.vspeak.top/nodes 的 alive + reported_at 新鲜度
+
+set -uo pipefail
+
+# Resolve project root from this script's location:
+#   <PROJECT_ROOT>/.claude/skills/sbm-inspect/scripts/inspect.sh
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
+cd "$PROJECT_ROOT"
+
+SINCE_MIN=15
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --since) SINCE_MIN="$2"; shift 2 ;;
+    *) echo "Unknown arg: $1" >&2; exit 1 ;;
+  esac
+done
+
+# --- 复用 deploy-all.sh 的 NODE_SSH 列表 ---
+DEPLOY_SH="$PROJECT_ROOT/scripts/deploy-all.sh"
+[ -f "$DEPLOY_SH" ] || { echo "deploy-all.sh not found at $DEPLOY_SH" >&2; exit 1; }
+
+declare -A NODE_SSH
+while IFS= read -r line; do
+  if [[ $line =~ ^[[:space:]]*\[([a-z0-9-]+)\]=\"([^\"]+)\" ]]; then
+    NODE_SSH[${BASH_REMATCH[1]}]="${BASH_REMATCH[2]}"
+  fi
+done < <(awk '/^declare -A NODE_SSH/,/^\)/' "$DEPLOY_SH")
+
+[ ${#NODE_SSH[@]} -eq 0 ] && { echo "Failed to parse NODE_SSH from $DEPLOY_SH" >&2; exit 1; }
+
+SSH_OPTS="-o ConnectTimeout=10 -o ServerAliveInterval=60 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=no -o BatchMode=yes"
+TMPDIR=$(mktemp -d)
+[ -n "${SBM_INSPECT_KEEP_TMP:-}" ] || trap 'rm -rf "$TMPDIR"' EXIT
+[ -n "${SBM_INSPECT_KEEP_TMP:-}" ] && echo "DEBUG: TMPDIR=$TMPDIR" >&2
+
+# --- 远程脚本：每节点单独 ssh，远程跑命令并打印 KEY=base64(value) 行 ---
+# base64 包裹值是为了避免任何 quote/换行 问题
+build_remote_script() {
+  local bin_path="$1"
+  local sudo_prefix="$2"
+  local since_min="$3"
+  cat <<REMOTE
+set +e
+SBM='${bin_path}'
+SINCE='${since_min} min ago'
+b64() { base64 -w0; }
+emit() { echo "\$1=\$(b64)"; }
+
+${sudo_prefix}systemctl is-active sbm-server sing-box 2>/dev/null | tr '\n' ' ' | emit ACTIVE
+${sudo_prefix}systemctl show sing-box -p NRestarts 2>/dev/null | cut -d= -f2 | tr -d '\n' | emit NRESTARTS
+\$SBM --json version 2>/dev/null | emit VERSION
+\$SBM --json metadata 2>/dev/null | emit METADATA
+\$SBM --json cert 2>/dev/null | emit CERT
+\$SBM --json bwg status 2>/dev/null | emit BWG
+\$SBM --json user list 2>/dev/null | emit USER
+${sudo_prefix}journalctl -u sbm-server --since "\$SINCE" --no-pager 2>/dev/null | grep -cE 'WARN|ALERT|ERR' | tr -d '\n' | emit SBMWARN
+${sudo_prefix}journalctl -u sing-box --since "\$SINCE" --no-pager 2>/dev/null | grep -cE 'FATAL|panic' | tr -d '\n' | emit SBFATAL
+${sudo_prefix}journalctl -u sbm-server --since "\$SINCE" --no-pager 2>/dev/null | grep -E 'WARN|ALERT|ERR' | tail -5 | emit WARNSAMPLE
+echo DONE
+REMOTE
+}
+
+inspect_one() {
+  local name="$1"
+  IFS='|' read -r ssh_target port bin_path method <<< "${NODE_SSH[$name]}"
+  local sudo_prefix=""
+  case "$method" in *-sudo) sudo_prefix="sudo " ;; esac
+  local script
+  script=$(build_remote_script "$bin_path" "$sudo_prefix" "$SINCE_MIN")
+  ssh $SSH_OPTS -p "$port" "$ssh_target" "$script" > "$TMPDIR/$name.out" 2> "$TMPDIR/$name.err"
+}
+
+# --- 并行采集 ---
+echo "Collecting from ${#NODE_SSH[@]} nodes (since ${SINCE_MIN}min)..." >&2
+pids=()
+for name in "${!NODE_SSH[@]}"; do
+  inspect_one "$name" &
+  pids+=("$!:$name")
+done
+for p in "${pids[@]}"; do
+  IFS=':' read -r pid n <<< "$p"
+  wait "$pid" 2>/dev/null
+done
+
+# --- CF /nodes ---
+CF_KEY="${SBM_CF_API_KEY:-sbm-topo-k8xPmQ2vNfW7rYzJ}"
+curl -sk --max-time 10 -H "X-API-Key: $CF_KEY" https://tun.vspeak.top/nodes > "$TMPDIR/cf-nodes.json" 2>/dev/null
+
+# --- Python 渲染 ---
+NODE_NAMES_CSV=$(IFS=,; echo "${!NODE_SSH[*]}")
+TMPDIR="$TMPDIR" SINCE_MIN="$SINCE_MIN" NODE_NAMES="$NODE_NAMES_CSV" python3 <<'PYEOF'
+import json, os, datetime, sys, base64
+
+tmp = os.environ['TMPDIR']
+since_min = int(os.environ['SINCE_MIN'])
+node_names = os.environ['NODE_NAMES'].split(',')
+
+def parse_kv_file(path):
+    """Parse KEY=base64value lines into dict of decoded strings."""
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return None
+    out = {}
+    with open(path, 'r', errors='replace') as f:
+        for line in f:
+            line = line.rstrip('\n')
+            if line == 'DONE':
+                out['_done'] = True
+                continue
+            if '=' not in line:
+                continue
+            k, v = line.split('=', 1)
+            try:
+                out[k] = base64.b64decode(v).decode('utf-8', errors='replace')
+            except Exception:
+                out[k] = ''
+    return out
+
+rows = []
+issues = []
+
+for name in sorted(node_names):
+    out_path = f"{tmp}/{name}.out"
+    err_path = f"{tmp}/{name}.err"
+    row = {'name': name, 'reachable': False}
+    kv = parse_kv_file(out_path)
+
+    if not kv or not kv.get('_done'):
+        err_msg = ''
+        if os.path.exists(err_path):
+            with open(err_path) as f:
+                err_msg = f.read().strip().split('\n')[-1][:80]
+        row['error'] = err_msg or 'no DONE marker'
+        rows.append(row)
+        issues.append(f"**{name}**: SSH/采集失败 — `{err_msg or 'no output'}`")
+        continue
+
+    row['reachable'] = True
+    row['active'] = kv.get('ACTIVE', '?').strip()
+    row['nrestarts'] = kv.get('NRESTARTS', '?').strip()
+
+    try:
+        vj = json.loads(kv.get('VERSION', '{}') or '{}')
+        row['sbm_version'] = vj.get('sbm_version', '?')
+        row['singbox_version'] = vj.get('singbox_version', '?').replace('sing-box version ', '')
+    except Exception:
+        row['sbm_version'] = '?'; row['singbox_version'] = '?'
+
+    try:
+        mj = json.loads(kv.get('METADATA', '{}') or '{}')
+        row['role'] = mj.get('role', '?')
+    except Exception:
+        row['role'] = '?'
+
+    try:
+        cj = json.loads(kv.get('CERT', '{}') or '{}')
+        row['cert_days'] = cj.get('days_remaining', '')
+    except Exception:
+        row['cert_days'] = ''
+
+    row['bwg_remaining'] = ''
+    try:
+        bj = json.loads(kv.get('BWG', '{}') or '{}')
+        if 'remaining_pct' in bj:
+            row['bwg_remaining'] = f"{bj['remaining_pct']:.1f}%"
+    except Exception:
+        pass
+
+    row['users'] = ''
+    try:
+        uj = json.loads(kv.get('USER', '[]') or '[]')
+        if isinstance(uj, list):
+            enabled = sum(1 for u in uj if u.get('enabled'))
+            row['users'] = f"{enabled}/{len(uj)}"
+    except Exception:
+        pass
+
+    try: row['sbm_warn'] = int((kv.get('SBMWARN', '0') or '0').strip())
+    except: row['sbm_warn'] = 0
+    try: row['singbox_fatal'] = int((kv.get('SBFATAL', '0') or '0').strip())
+    except: row['singbox_fatal'] = 0
+    row['warn_sample'] = kv.get('WARNSAMPLE', '')
+
+    rows.append(row)
+
+    # 异常累积
+    parts = row['active'].split()
+    if not parts or parts[0] != 'active' or (len(parts) > 1 and parts[1] != 'active'):
+        issues.append(f"**{name}**: 服务异常 active=`{row['active']}`")
+    try:
+        if int(row['nrestarts']) > 0:
+            issues.append(f"**{name}**: sing-box NRestarts=`{row['nrestarts']}`（异常重启）")
+    except: pass
+    if row['sbm_warn'] > 0:
+        sample = row['warn_sample'].strip()
+        sample_lines = sample.split('\n')[:5]
+        sample_block = '\n'.join('  ' + l for l in sample_lines)
+        issues.append(f"**{name}**: sbm-server 最近 {since_min}min 有 {row['sbm_warn']} 条 WARN/ALERT/ERR\n  ```\n{sample_block}\n  ```")
+    if row['singbox_fatal'] > 0:
+        issues.append(f"**{name}**: sing-box 最近 {since_min}min 有 {row['singbox_fatal']} 条 FATAL/panic")
+    if isinstance(row['cert_days'], int) and row['cert_days'] < 14:
+        issues.append(f"**{name}**: 证书剩余 {row['cert_days']} 天（< 14）")
+    if row['bwg_remaining']:
+        try:
+            pct = float(row['bwg_remaining'].rstrip('%'))
+            if pct < 20:
+                issues.append(f"**{name}**: BWG 剩余带宽 {row['bwg_remaining']}（< 20%）")
+        except: pass
+
+# --- 节点健康表 ---
+print("# sbm 全节点巡检报告\n")
+print(f"时间窗口: 最近 {since_min} 分钟  |  生成时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S %Z')}\n")
+print("## 节点健康\n")
+print("| 节点 | 角色 | sbm | sing-box | restarts | sbm-ver | sb-ver | 证书 | BWG | 用户 | WARN | FATAL |")
+print("|------|------|-----|----------|----------|---------|--------|------|-----|------|------|-------|")
+for r in rows:
+    if not r['reachable']:
+        print(f"| {r['name']} | ? | ❌ | — | — | — | — | — | — | — | — | — |")
+        continue
+    parts = r['active'].split()
+    sbm_ok = '✅' if (parts and parts[0] == 'active') else '❌'
+    sb_ok = '✅' if (len(parts) > 1 and parts[1] == 'active') else '❌'
+    cert = f"{r['cert_days']}d" if isinstance(r['cert_days'], int) else ''
+    warn_cell = '0' if r['sbm_warn'] == 0 else f"⚠️ {r['sbm_warn']}"
+    fatal_cell = '0' if r['singbox_fatal'] == 0 else f"🔴 {r['singbox_fatal']}"
+    print(f"| {r['name']} | {r['role']} | {sbm_ok} | {sb_ok} | {r['nrestarts']} | {r['sbm_version']} | {r['singbox_version']} | {cert} | {r['bwg_remaining']} | {r['users']} | {warn_cell} | {fatal_cell} |")
+
+# --- CF /nodes ---
+print("\n## CF 注册表（双控制面）\n")
+try:
+    with open(f"{tmp}/cf-nodes.json") as f:
+        cf = json.load(f)
+    if isinstance(cf, dict) and 'error' in cf:
+        print(f"❌ CF 拉取失败: `{cf}`")
+        issues.append(f"**CF**: /nodes 鉴权失败 `{cf}`")
+    else:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        print("| 节点 | 角色 | 版本 | alive | 上报间隔 |")
+        print("|------|------|------|-------|----------|")
+        cf_stale = 0; cf_dead = 0
+        for n in sorted(cf, key=lambda x: x['name']):
+            try:
+                t = datetime.datetime.fromisoformat(n['reported_at'].replace('Z', '+00:00'))
+                age = int((now - t).total_seconds())
+                if age < 360:
+                    fresh = f"{age}s"
+                else:
+                    fresh = f"{age//60}min ⚠️"; cf_stale += 1
+            except Exception:
+                fresh = '?'
+            alive = '✅' if n.get('alive') else '❌'
+            if not n.get('alive'): cf_dead += 1
+            print(f"| {n['name']} | {n.get('role','?')} | v{n.get('sbm_version','?')} | {alive} | {fresh} |")
+        if cf_stale:
+            issues.append(f"**CF**: {cf_stale} 个节点上报陈旧（> 6min）")
+        if cf_dead:
+            issues.append(f"**CF**: {cf_dead} 个节点 alive=false")
+except FileNotFoundError:
+    print("❌ CF 注册表未抓取")
+    issues.append("**CF**: /nodes 接口请求失败")
+except Exception as e:
+    print(f"❌ CF 解析失败: {e}")
+    issues.append(f"**CF**: 解析异常 — {e}")
+
+# --- 版本一致性 ---
+versions = set()
+for r in rows:
+    if r['reachable'] and r.get('sbm_version', '?') != '?':
+        versions.add(r['sbm_version'])
+if len(versions) > 1:
+    issues.append(f"**版本漂移**: 集群存在多版本 {sorted(versions)}")
+
+# --- 异常摘要 ---
+print("\n## 异常摘要\n")
+if not issues:
+    print("✅ **全绿** — 无异常\n")
+else:
+    print(f"⚠️ **发现 {len(issues)} 项异常**:\n")
+    for i, msg in enumerate(issues, 1):
+        print(f"{i}. {msg}")
+    print()
+
+sys.exit(0 if not issues else 1)
+PYEOF
