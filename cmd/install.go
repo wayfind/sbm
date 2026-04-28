@@ -528,6 +528,17 @@ func installEntryNode(f *InstallFlags) error {
 		upstreamMetas[i] = internal.UpstreamMeta{Name: t.Name, Address: t.Address, Priority: i}
 	}
 
+	// Capture per-transit brutal CC settings into metadata so reconcile preserves them.
+	var hy2Brutal map[string]internal.Hy2BrutalConfig
+	for _, t := range upCfg.Transits {
+		if t.UpMbps > 0 && t.DownMbps > 0 {
+			if hy2Brutal == nil {
+				hy2Brutal = map[string]internal.Hy2BrutalConfig{}
+			}
+			hy2Brutal[t.Name] = internal.Hy2BrutalConfig{UpMbps: t.UpMbps, DownMbps: t.DownMbps}
+		}
+	}
+
 	meta := &internal.Metadata{
 		Version: 2, Role: internal.RoleEntry, NodeID: nodeID,
 		Name: f.Name, Domain: f.Domain, SubPort: f.SubPort,
@@ -535,6 +546,7 @@ func installEntryNode(f *InstallFlags) error {
 		CFWorkerURL: f.CFWorkerURL,
 		CFAPIKey:    f.CFAPIKey,
 		APIToken:    f.CFAPIKey,
+		Hy2Brutal:   hy2Brutal,
 	}
 	if f.BWGVeid != "" && f.BWGAPIKey != "" {
 		meta.BWG = &internal.BWGConfig{VEID: f.BWGVeid, APIKey: f.BWGAPIKey}

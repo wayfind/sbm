@@ -96,12 +96,23 @@ type Metadata struct {
 	ExitVlessPorts map[string]int    `json:"exit_vless_ports,omitempty"` // entry: exit_name → per-exit vless inbound port
 	ExitHy2Ports   map[string]int    `json:"exit_hy2_ports,omitempty"`   // entry: exit_name → per-exit hy2 inbound port
 
+	// hy2 brutal congestion control per transit (entry-only).
+	// Key = transit name. When set, entry's hy2 outbound to that transit
+	// declares up_mbps/down_mbps to claim bandwidth from QoS-throttled paths.
+	Hy2Brutal map[string]Hy2BrutalConfig `json:"hy2_brutal,omitempty"`
+
 	// SBM binary version that last generated/rebuilt the config.
 	// Used by reconcile to detect schema changes after sbm upgrade.
 	SBMVersion string `json:"sbm_version,omitempty"`
 
 	// Transient field: Reality private key recovered from old config (not serialized)
 	PrivateKey string `json:"-"`
+}
+
+// Hy2BrutalConfig is the per-upstream brutal congestion control settings.
+type Hy2BrutalConfig struct {
+	UpMbps   int `json:"up_mbps,omitempty"`
+	DownMbps int `json:"down_mbps,omitempty"`
 }
 
 // LoadMetadata loads metadata.json with automatic v0→v2 migration.

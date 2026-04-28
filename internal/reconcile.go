@@ -161,6 +161,9 @@ func ReconcileEntryConfig(meta *Metadata, downstreams []TopologyTree, db *sql.DB
 	desiredTransits := topoToTransits(downstreams)
 	desiredExits := topoToExits(downstreams)
 
+	// Apply per-transit hy2 brutal config from metadata (entry policy, not topology).
+	applyHy2Brutal(desiredTransits, meta.Hy2Brutal)
+
 	if len(desiredTransits) == 0 {
 		log.Println("[reconcile] no alive transits, skipping")
 		return nil
@@ -424,6 +427,28 @@ func topoToTransits(downstreams []TopologyTree) []TransitInfo {
 	// and failover rebalance (bandwidth-based). Alphabetical sort would
 	// override failover's bandwidth balancing on every reconcile cycle.
 	return result
+}
+
+// applyHy2Brutal patches transits in place with brutal CC settings from metadata.
+// Only applies when both UpMbps and DownMbps are positive — partial config is ignored.
+// Only affects hysteria2 transits; vless entries are untouched.
+func applyHy2Brutal(transits []TransitInfo, brutal map[string]Hy2BrutalConfig) {
+	if len(brutal) == 0 {
+		return
+	}
+	for i := range transits {
+		if transits[i].Protocol != "hysteria2" {
+			continue
+		}
+		cfg, ok := brutal[transits[i].Name]
+		if !ok {
+			continue
+		}
+		if cfg.UpMbps > 0 && cfg.DownMbps > 0 {
+			transits[i].UpMbps = cfg.UpMbps
+			transits[i].DownMbps = cfg.DownMbps
+		}
+	}
 }
 
 func topoToExits(downstreams []TopologyTree) []ExitInfo {

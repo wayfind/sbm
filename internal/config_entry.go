@@ -60,6 +60,13 @@ type TransitInfo struct {
 	ShortID   string `json:"short_id,omitempty"`
 	Insecure  bool   `json:"insecure,omitempty"`
 
+	// hy2 brutal congestion control. When >0, hy2 outbound declares
+	// these bandwidths and uses brutal CC to claim them from the path.
+	// Useful on QoS-throttled links (e.g. 腾讯云国际出口) where BBR-like
+	// CC backs off too aggressively. Leave 0 to use hy2 default (BBR-like).
+	UpMbps   int `json:"up_mbps,omitempty"`
+	DownMbps int `json:"down_mbps,omitempty"`
+
 	BWGStatus *BWGStatus `json:"-"` // from topology, not serialized
 }
 
@@ -235,6 +242,12 @@ func BuildProxyOutbound(tag string, t *TransitInfo) map[string]interface{} {
 		}
 		if t.Insecure {
 			out["tls"].(map[string]interface{})["insecure"] = true
+		}
+		if t.UpMbps > 0 {
+			out["up_mbps"] = t.UpMbps
+		}
+		if t.DownMbps > 0 {
+			out["down_mbps"] = t.DownMbps
 		}
 		return out
 

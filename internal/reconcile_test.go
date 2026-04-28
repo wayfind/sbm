@@ -304,3 +304,72 @@ func fullEntryConfig(inboundUsers, statsUsers []string) map[string]interface{} {
 		},
 	}
 }
+
+
+// ── applyHy2Brutal ──────────────────────────────────────────────────────────
+
+func TestApplyHy2Brutal(t *testing.T) {
+	transits := []TransitInfo{
+		{Name: "metask", Protocol: "hysteria2"},
+		{Name: "shuzuan", Protocol: "hysteria2"},
+		{Name: "lisa", Protocol: "vless"},     // vless: must be untouched
+		{Name: "yl", Protocol: "hysteria2"},   // not in brutal map: must be untouched
+	}
+	brutal := map[string]Hy2BrutalConfig{
+		"metask":  {UpMbps: 50, DownMbps: 300},
+		"shuzuan": {UpMbps: 50, DownMbps: 0}, // partial: must be ignored
+		"lisa":    {UpMbps: 10, DownMbps: 100},
+	}
+	applyHy2Brutal(transits, brutal)
+
+	if transits[0].UpMbps != 50 || transits[0].DownMbps != 300 {
+		t.Errorf("metask: got up=%d down=%d, want 50/300", transits[0].UpMbps, transits[0].DownMbps)
+	}
+	if transits[1].UpMbps != 0 || transits[1].DownMbps != 0 {
+		t.Errorf("shuzuan: partial config should be ignored, got up=%d down=%d", transits[1].UpMbps, transits[1].DownMbps)
+	}
+	if transits[2].UpMbps != 0 || transits[2].DownMbps != 0 {
+		t.Errorf("lisa: vless protocol should be skipped, got up=%d down=%d", transits[2].UpMbps, transits[2].DownMbps)
+	}
+	if transits[3].UpMbps != 0 || transits[3].DownMbps != 0 {
+		t.Errorf("yl: not in brutal map, got up=%d down=%d", transits[3].UpMbps, transits[3].DownMbps)
+	}
+}
+
+func TestApplyHy2BrutalNilMap(t *testing.T) {
+	transits := []TransitInfo{{Name: "metask", Protocol: "hysteria2", UpMbps: 99, DownMbps: 99}}
+	applyHy2Brutal(transits, nil)
+	if transits[0].UpMbps != 99 || transits[0].DownMbps != 99 {
+		t.Errorf("nil brutal map should be no-op, got %d/%d", transits[0].UpMbps, transits[0].DownMbps)
+	}
+}
+
+func TestBuildProxyOutboundHy2Brutal(t *testing.T) {
+	t.Run("with brutal", func(t *testing.T) {
+		ti := &TransitInfo{
+			Name: "metask", Protocol: "hysteria2",
+			Address: "x.example", Port: 443, Password: "pw", SNI: "x.example",
+			UpMbps: 50, DownMbps: 300,
+		}
+		out := BuildProxyOutbound("transit-metask", ti)
+		if out["up_mbps"] != 50 {
+			t.Errorf("up_mbps: got %v", out["up_mbps"])
+		}
+		if out["down_mbps"] != 300 {
+			t.Errorf("down_mbps: got %v", out["down_mbps"])
+		}
+	})
+	t.Run("without brutal", func(t *testing.T) {
+		ti := &TransitInfo{
+			Name: "metask", Protocol: "hysteria2",
+			Address: "x.example", Port: 443, Password: "pw", SNI: "x.example",
+		}
+		out := BuildProxyOutbound("transit-metask", ti)
+		if _, has := out["up_mbps"]; has {
+			t.Errorf("up_mbps should be absent when not configured")
+		}
+		if _, has := out["down_mbps"]; has {
+			t.Errorf("down_mbps should be absent when not configured")
+		}
+	})
+}

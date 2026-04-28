@@ -43,6 +43,7 @@ make deploy   # scp 到目标服务器
 | yl_lisa家宽 | root | 104.247.120.170 | 14303 | - | |
 | picaospark网关 | david | 175.27.169.180 | 22 | 腾讯云 | s-ui + H800 中转 |
 | ai网关 | ubuntu | napi.origintask.cn | 22 | 腾讯云 | |
+| office gateway | root | 192.168.1.100 | 10023 | - | 办公室软路由网关 |
 
 > SSH 保活: `-o ServerAliveInterval=60 -o ServerAliveCountMax=5`
 
