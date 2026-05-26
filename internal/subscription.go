@@ -17,9 +17,9 @@ func GenerateUserSubscription(user *UserWithTraffic) (string, error) {
 		return "", err
 	}
 
-	addr := meta.Domain
+	addr := meta.EffectiveHost()
 	if addr == "" {
-		return "", fmt.Errorf("no domain configured")
+		return "", fmt.Errorf("no host configured")
 	}
 
 	var uris []string

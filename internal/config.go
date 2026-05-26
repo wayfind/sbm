@@ -74,6 +74,12 @@ type Metadata struct {
 	Name    string   `json:"name,omitempty"`
 	Domain  string   `json:"domain,omitempty"`
 
+	// PublicHost overrides Domain in subscription URIs and sub_url display only.
+	// TLS server_name, ACME, and CF topology still use Domain. Use this when the
+	// client-facing address differs from the certificate domain (e.g. NAT'd node
+	// reusing another node's cert).
+	PublicHost string `json:"public_host,omitempty"`
+
 	Inbounds  []InboundMeta  `json:"inbounds,omitempty"`
 	Upstreams []UpstreamMeta `json:"upstreams,omitempty"`
 
@@ -215,6 +221,15 @@ func (m *Metadata) Save() error {
 		return err
 	}
 	return os.WriteFile(MetadataPath(), data, 0600)
+}
+
+// EffectiveHost returns the client-facing host: PublicHost if set, otherwise Domain.
+// Use this in subscription URIs and sub_url display. Do not use for TLS / ACME / CF.
+func (m *Metadata) EffectiveHost() string {
+	if m.PublicHost != "" {
+		return m.PublicHost
+	}
+	return m.Domain
 }
 
 // --- sing-box config read ---

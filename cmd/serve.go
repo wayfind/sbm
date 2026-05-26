@@ -227,20 +227,27 @@ func makeAPIUsersRouter(db *sql.DB, meta *internal.Metadata, cfClient *internal.
 		if selfPort == 0 {
 			selfPort = 20033
 		}
-		urls := []string{fmt.Sprintf("https://%s:%d/sub/%s", meta.Domain, selfPort, username)}
+		urls := []string{fmt.Sprintf("https://%s:%d/sub/%s", meta.EffectiveHost(), selfPort, username)}
 
 		if cfClient != nil {
 			nodes, err := cfClient.GetAllNodes()
 			if err == nil {
 				for _, n := range nodes {
-					if n.Role != internal.RoleEntry || n.NodeID == meta.NodeID || n.Domain == "" {
+					if n.Role != internal.RoleEntry || n.NodeID == meta.NodeID {
+						continue
+					}
+					host := n.PublicHost
+					if host == "" {
+						host = n.Domain
+					}
+					if host == "" {
 						continue
 					}
 					port := n.SubPort
 					if port == 0 {
 						port = 20033
 					}
-					urls = append(urls, fmt.Sprintf("https://%s:%d/sub/%s", n.Domain, port, username))
+					urls = append(urls, fmt.Sprintf("https://%s:%d/sub/%s", host, port, username))
 				}
 			}
 		}

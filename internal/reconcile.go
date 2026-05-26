@@ -338,7 +338,13 @@ func ReconcileUpstreams(meta *Metadata, cfClient *CFTopoClient) bool {
 		if now.Sub(n.ReportedAt) > StaleThreshold {
 			continue
 		}
-		addr := n.Domain
+		// Prefer PublicHost (client-facing reachable host) over Domain (TLS server_name).
+		// When a node has both — e.g. entry behind NAT reusing another node's cert —
+		// chain reporting must hit the real IP, not the cert's DNS name.
+		addr := n.PublicHost
+		if addr == "" {
+			addr = n.Domain
+		}
 		if addr == "" {
 			addr = n.Address
 		}
@@ -503,7 +509,11 @@ func collectExitNodes(downstreams []TopologyTree) []NodeInfo {
 }
 
 func pickBestInbound(node NodeInfo) *TransitInfo {
-	addr := node.Domain
+	// Connection target: prefer PublicHost over Domain (see ReconcileUpstreams addr).
+	addr := node.PublicHost
+	if addr == "" {
+		addr = node.Domain
+	}
 	if addr == "" {
 		addr = node.Address
 	}

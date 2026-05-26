@@ -18,6 +18,7 @@ import (
 type InstallFlags struct {
 	Role          string
 	Domain        string
+	PublicHost    string
 	VlessPort     int
 	Hy2Port       int
 	SubPort       int
@@ -31,6 +32,15 @@ type InstallFlags struct {
 	CFAPIKey      string
 	BWGVeid       string
 	BWGAPIKey     string
+}
+
+// effectivePublicHost returns the client-facing host: PublicHost if set, else Domain.
+// Used in sub_url display and install result output.
+func effectivePublicHost(f *InstallFlags) string {
+	if f.PublicHost != "" {
+		return f.PublicHost
+	}
+	return f.Domain
 }
 
 // cryptoMaterials holds generated keys/passwords for a new installation.
@@ -48,6 +58,7 @@ func RunInstall(args []string) error {
 	var f InstallFlags
 	fs.StringVar(&f.Role, "role", "transit", "节点角色: transit, exit, entry, client")
 	fs.StringVar(&f.Domain, "domain", "", "域名 (必选)")
+	fs.StringVar(&f.PublicHost, "public-host", "", "客户端连接用的主机/IP，订阅 URL 也用它；空则回退到 --domain")
 	fs.IntVar(&f.VlessPort, "vless-port", 0, "VLESS 端口 (默认随机)")
 	fs.IntVar(&f.Hy2Port, "hy2-port", 0, "Hysteria2 端口 (默认随机)")
 	fs.IntVar(&f.SubPort, "sub-port", 20033, "订阅服务端口")
@@ -342,7 +353,7 @@ func installServerNode(role internal.NodeRole, f *InstallFlags) error {
 
 	meta := &internal.Metadata{
 		Version: 2, Role: role, NodeID: nodeID,
-		Name: f.Name, Domain: f.Domain, SubPort: f.SubPort,
+		Name: f.Name, Domain: f.Domain, PublicHost: f.PublicHost, SubPort: f.SubPort,
 		Inbounds:    inboundMetas,
 		CFWorkerURL: f.CFWorkerURL,
 		CFAPIKey:    f.CFAPIKey,
@@ -372,7 +383,7 @@ func installServerNode(role internal.NodeRole, f *InstallFlags) error {
 	}
 	if f.Domain != "" {
 		resultData["domain"] = f.Domain
-		resultData["sub_url"] = fmt.Sprintf("https://%s:%d/sub/hz-office", f.Domain, f.SubPort)
+		resultData["sub_url"] = fmt.Sprintf("https://%s:%d/sub/hz-office", effectivePublicHost(f), f.SubPort)
 	}
 	if role == internal.RoleTransit {
 		resultData["hy2_port"] = f.Hy2Port
@@ -398,7 +409,7 @@ func installServerNode(role internal.NodeRole, f *InstallFlags) error {
 			fmt.Printf("SOCKS5:     %d/tcp (user: %s)\n", socks5Port, params.Socks5User)
 		}
 		if f.Domain != "" {
-			fmt.Printf("订阅地址:   https://%s:%d/sub/hz-office\n", f.Domain, f.SubPort)
+			fmt.Printf("订阅地址:   https://%s:%d/sub/hz-office\n", effectivePublicHost(f), f.SubPort)
 		}
 		result, _ := json.MarshalIndent(resultData, "", "  ")
 		fmt.Println(string(result))
@@ -541,7 +552,7 @@ func installEntryNode(f *InstallFlags) error {
 
 	meta := &internal.Metadata{
 		Version: 2, Role: internal.RoleEntry, NodeID: nodeID,
-		Name: f.Name, Domain: f.Domain, SubPort: f.SubPort,
+		Name: f.Name, Domain: f.Domain, PublicHost: f.PublicHost, SubPort: f.SubPort,
 		Inbounds: inboundMetas, Upstreams: upstreamMetas,
 		CFWorkerURL: f.CFWorkerURL,
 		CFAPIKey:    f.CFAPIKey,
@@ -570,7 +581,7 @@ func installEntryNode(f *InstallFlags) error {
 		"status": "ok", "role": "entry", "domain": f.Domain,
 		"vless_port": f.VlessPort, "hy2_port": f.Hy2Port,
 		"transits": len(upCfg.Transits), "exits": len(upCfg.Exits),
-		"sub_url": fmt.Sprintf("https://%s:%d/sub/hz-office", f.Domain, f.SubPort),
+		"sub_url": fmt.Sprintf("https://%s:%d/sub/hz-office", effectivePublicHost(f), f.SubPort),
 	}
 
 	if internal.JSONMode {
@@ -585,7 +596,7 @@ func installEntryNode(f *InstallFlags) error {
 		if upCfg.Socks5 != nil && upCfg.Socks5.Port > 0 {
 			fmt.Printf("SOCKS5:     %d/tcp\n", upCfg.Socks5.Port)
 		}
-		fmt.Printf("订阅地址:   https://%s:%d/sub/hz-office\n", f.Domain, f.SubPort)
+		fmt.Printf("订阅地址:   https://%s:%d/sub/hz-office\n", effectivePublicHost(f), f.SubPort)
 		result, _ := json.MarshalIndent(resultData, "", "  ")
 		fmt.Println(string(result))
 	}

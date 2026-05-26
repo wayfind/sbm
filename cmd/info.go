@@ -36,7 +36,7 @@ func RunSub() error {
 	if subPort == 0 {
 		subPort = 20033
 	}
-	subBase := fmt.Sprintf("https://%s:%d/sub", meta.Domain, subPort)
+	subBase := fmt.Sprintf("https://%s:%d/sub", meta.EffectiveHost(), subPort)
 
 	db, err := internal.OpenUsersDB()
 	if err != nil {
