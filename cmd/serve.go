@@ -134,11 +134,31 @@ func RunServe(args []string) error {
 
 	log.Printf("subscription server listening on :%d (role=%s)", listenPort, meta.Role)
 
+	// Optional plaintext HTTP listener for /sub/ only.
+	// Browsers warn on IP-based HTTPS (cert host mismatch) — this gives clients
+	// a no-warning HTTP fallback for subscription fetch. Only the subscription
+	// path is exposed; dashboard / API / report stay HTTPS-only.
+	var httpSrv *http.Server
+	if meta.HTTPSubPort > 0 && usersDB != nil {
+		httpMux := http.NewServeMux()
+		httpMux.HandleFunc("/sub/", makeUserSubHandler(usersDB))
+		httpSrv = &http.Server{
+			Addr:    fmt.Sprintf(":%d", meta.HTTPSubPort),
+			Handler: stripServerHeader(httpMux),
+		}
+		log.Printf("HTTP subscription listener on :%d (/sub/ only)", meta.HTTPSubPort)
+	}
+
 	// Graceful shutdown on SIGINT/SIGTERM
-	done := make(chan error, 1)
+	done := make(chan error, 2)
 	go func() {
 		done <- srv.ListenAndServeTLS("", "")
 	}()
+	if httpSrv != nil {
+		go func() {
+			done <- httpSrv.ListenAndServe()
+		}()
+	}
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -150,6 +170,9 @@ func RunServe(args []string) error {
 		log.Printf("received %s, shutting down...", sig)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		if httpSrv != nil {
+			_ = httpSrv.Shutdown(ctx)
+		}
 		return srv.Shutdown(ctx)
 	}
 }
@@ -228,6 +251,9 @@ func makeAPIUsersRouter(db *sql.DB, meta *internal.Metadata, cfClient *internal.
 			selfPort = 20033
 		}
 		urls := []string{fmt.Sprintf("https://%s:%d/sub/%s", meta.EffectiveHost(), selfPort, username)}
+		if meta.HTTPSubPort > 0 {
+			urls = append(urls, fmt.Sprintf("http://%s:%d/sub/%s", meta.EffectiveHost(), meta.HTTPSubPort, username))
+		}
 
 		if cfClient != nil {
 			nodes, err := cfClient.GetAllNodes()

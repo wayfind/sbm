@@ -37,6 +37,10 @@ func RunSub() error {
 		subPort = 20033
 	}
 	subBase := fmt.Sprintf("https://%s:%d/sub", meta.EffectiveHost(), subPort)
+	var httpSubBase string
+	if meta.HTTPSubPort > 0 {
+		httpSubBase = fmt.Sprintf("http://%s:%d/sub", meta.EffectiveHost(), meta.HTTPSubPort)
+	}
 
 	db, err := internal.OpenUsersDB()
 	if err != nil {
@@ -53,11 +57,16 @@ func RunSub() error {
 		type subEntry struct {
 			Name    string `json:"name"`
 			URL     string `json:"url"`
+			HTTPURL string `json:"http_url,omitempty"`
 			Enabled bool   `json:"enabled"`
 		}
 		entries := make([]subEntry, len(users))
 		for i, u := range users {
-			entries[i] = subEntry{Name: u.Name, URL: subBase + "/" + u.Name, Enabled: u.Enabled}
+			e := subEntry{Name: u.Name, URL: subBase + "/" + u.Name, Enabled: u.Enabled}
+			if httpSubBase != "" {
+				e.HTTPURL = httpSubBase + "/" + u.Name
+			}
+			entries[i] = e
 		}
 		internal.PrintJSON(entries)
 		return nil
@@ -74,6 +83,9 @@ func RunSub() error {
 			status = "✗"
 		}
 		fmt.Printf("  %s %s/%s\n", status, subBase, u.Name)
+		if httpSubBase != "" {
+			fmt.Printf("    %s/%s  (HTTP)\n", httpSubBase, u.Name)
+		}
 	}
 	return nil
 }

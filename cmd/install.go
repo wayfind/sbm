@@ -22,6 +22,7 @@ type InstallFlags struct {
 	VlessPort     int
 	Hy2Port       int
 	SubPort       int
+	HTTPSubPort   int
 	SNI           string
 	Force         bool
 	UpstreamsFile string
@@ -62,6 +63,7 @@ func RunInstall(args []string) error {
 	fs.IntVar(&f.VlessPort, "vless-port", 0, "VLESS 端口 (默认随机)")
 	fs.IntVar(&f.Hy2Port, "hy2-port", 0, "Hysteria2 端口 (默认随机)")
 	fs.IntVar(&f.SubPort, "sub-port", 20033, "订阅服务端口")
+	fs.IntVar(&f.HTTPSubPort, "http-sub-port", 0, "明文 HTTP 订阅端口（可选，仅暴露 /sub/，规避 IP 证书警告）")
 	fs.StringVar(&f.SNI, "sni", "", "VLESS Reality SNI (entry 默认 cloud.tencent.com, transit 默认 www.walmart.com)")
 	fs.BoolVar(&f.Force, "force", false, "跳过替换确认")
 	fs.StringVar(&f.UpstreamsFile, "upstreams", "", "上游节点配置文件 (entry 必选)")
@@ -228,6 +230,9 @@ func finishInstall(f *InstallFlags, role internal.NodeRole, extraTCPPorts ...int
 	}
 	if role == internal.RoleEntry {
 		internal.FirewallAddPort(f.SubPort, "tcp")
+		if f.HTTPSubPort > 0 {
+			internal.FirewallAddPort(f.HTTPSubPort, "tcp")
+		}
 	}
 	for _, p := range extraTCPPorts {
 		internal.FirewallAddPort(p, "tcp")
@@ -353,7 +358,7 @@ func installServerNode(role internal.NodeRole, f *InstallFlags) error {
 
 	meta := &internal.Metadata{
 		Version: 2, Role: role, NodeID: nodeID,
-		Name: f.Name, Domain: f.Domain, PublicHost: f.PublicHost, SubPort: f.SubPort,
+		Name: f.Name, Domain: f.Domain, PublicHost: f.PublicHost, SubPort: f.SubPort, HTTPSubPort: f.HTTPSubPort,
 		Inbounds:    inboundMetas,
 		CFWorkerURL: f.CFWorkerURL,
 		CFAPIKey:    f.CFAPIKey,
@@ -552,7 +557,7 @@ func installEntryNode(f *InstallFlags) error {
 
 	meta := &internal.Metadata{
 		Version: 2, Role: internal.RoleEntry, NodeID: nodeID,
-		Name: f.Name, Domain: f.Domain, PublicHost: f.PublicHost, SubPort: f.SubPort,
+		Name: f.Name, Domain: f.Domain, PublicHost: f.PublicHost, SubPort: f.SubPort, HTTPSubPort: f.HTTPSubPort,
 		Inbounds: inboundMetas, Upstreams: upstreamMetas,
 		CFWorkerURL: f.CFWorkerURL,
 		CFAPIKey:    f.CFAPIKey,

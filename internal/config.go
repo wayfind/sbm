@@ -86,8 +86,9 @@ type Metadata struct {
 	// UpstreamsMu protects concurrent read/write of Upstreams (reconcile vs topology reporter).
 	UpstreamsMu sync.RWMutex `json:"-"`
 
-	SubPort  int    `json:"sub_port,omitempty"`
-	APIToken string `json:"api_token,omitempty"`
+	SubPort     int    `json:"sub_port,omitempty"`
+	HTTPSubPort int    `json:"http_sub_port,omitempty"` // optional plaintext HTTP listener for /sub/ (avoids IP-based HTTPS browser warning)
+	APIToken    string `json:"api_token,omitempty"`
 
 	BWG *BWGConfig `json:"bwg,omitempty"`
 
