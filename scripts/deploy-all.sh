@@ -34,6 +34,7 @@ declare -A NODE_SSH=(
   [yl-lisa]="root@104.247.120.170|14303|/root/sbm|systemd"
   [zgo]="root@23.185.200.18|22|/usr/local/bin/sbm|systemd"
   [ai-entry]="ubuntu@napi.origintask.cn|22|/usr/local/bin/sbm|systemd-sudo"
+  [kunshan]="shuzuan@58.211.6.133|104|/usr/local/bin/sbm|systemd-sudo"
 )
 
 SSH_OPTS="-o ConnectTimeout=10 -o ServerAliveInterval=60 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=no"
