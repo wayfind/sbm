@@ -44,6 +44,7 @@ make deploy   # scp 到目标服务器
 | picaospark网关 | david | 175.27.169.180 | 22 | 腾讯云 | s-ui + H800 中转 |
 | ai网关 | ubuntu | napi.origintask.cn | 22 | 腾讯云 | |
 | office gateway | root | 192.168.1.100 | 10023 | - | 办公室软路由网关 |
+| kunshan | shuzuan | 58.211.6.133 | 104 | - | sbm entry，NAT 后，复用 metask 证书 |
 
 > SSH 保活: `-o ServerAliveInterval=60 -o ServerAliveCountMax=5`
 
@@ -136,6 +137,38 @@ sbm 管理的独立节点，AlmaLinux 9.7。
 ### ai网关 (napi.origintask.cn)
 
 腾讯云，API 网关服务。
+
+---
+
+### kunshan (58.211.6.133)
+
+sbm 管理的 entry 节点（NAT 后，公网端口映射通过路由器配置）。
+
+**接入信息**:
+- 公网 IP: 58.211.6.133（运营商 NAT）
+- 内网 IP: 192.168.10.104/24
+- SSH 端口: 22 (内网) / 104 (公网映射)
+- 用户: shuzuan（已配 NOPASSWD sudo）
+- 系统: Ubuntu 22.04.5 LTS
+- 硬件: 8 核 CPU / 32GB 内存 / 200GB 磁盘
+
+**sing-box**: 由 sbm 管理（role=entry）
+- 配置: `/etc/sing-box/config.json`
+- 元数据: `/etc/sing-box/metadata.json`（含 `public_host=58.211.6.133`，复用 metask 证书）
+- 入站端口（公网映射 1:1）：sub HTTPS 10410/tcp、hy2 10411/udp、vless 10412/tcp
+- 订阅: `https://58.211.6.133:10410/sub/<name>`（IP + 自签证书路径，客户端需 skip_cert_verify）
+- 管理: `/usr/local/bin/sbm`
+
+**证书**: `/etc/sing-box/cert/` 复用 metask 的 LE 证书（CN=metaskgia.vspeak.top）。同时备份到 `/root/cert/metaskgia.vspeak.top/` 给 sbm serve 用。续期需从 metask 手动 rsync 过来。
+
+**已安装开发工具**:
+- Node.js v20.20.0 (LTS), npm 10.8.2
+- GitHub CLI (gh) 2.86.0
+- Claude Code 2.1.19
+- opencode 1.1.36, OpenAI Codex 0.91.0, Google Gemini CLI 0.25.2
+- 自定义脚本: lisacc, lisagemini, lisacodex (通过 lisa 代理)
+
+> 详细文档见 `~/prj/maintain/docs/kunshan-server.md`
 
 ---
 
