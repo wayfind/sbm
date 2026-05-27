@@ -89,9 +89,11 @@ func getTopoFromDualView(meta *Metadata, store *TopoStore, cfClient *CFTopoClien
 		for _, n := range cfNodes {
 			cfIDs[n.NodeID] = true
 		}
-		upstreamAddrs := map[string]bool{}
+		// Match upstreams by Name (unique), not Address — multiple nodes can
+		// share an Address when a NAT'd entry reuses another node's cert domain.
+		upstreamNames := map[string]bool{}
 		for _, u := range meta.Upstreams {
-			upstreamAddrs[u.Address] = true
+			upstreamNames[u.Name] = true
 		}
 		// ALERT: a configured upstream (transit) surfaces in CF but never reached us
 		// through chain → data-plane break between this entry and that transit.
@@ -103,7 +105,7 @@ func getTopoFromDualView(meta *Metadata, store *TopoStore, cfClient *CFTopoClien
 			if n.NodeID == meta.NodeID {
 				continue
 			}
-			if upstreamAddrs[n.Address] && !localIDs[n.NodeID] {
+			if upstreamNames[n.Name] && !localIDs[n.NodeID] {
 				log.Printf("[reconcile] ALERT: upstream %s (%s) in CF but not in chain → data-plane break?",
 					n.Name, n.Address)
 			}
