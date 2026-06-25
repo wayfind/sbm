@@ -2,6 +2,7 @@ package internal
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -16,6 +17,9 @@ import (
 
 // ConfigMu protects concurrent read-modify-write of sing-box config.json.
 var ConfigMu sync.Mutex
+
+// processStartTime is set at init for cold-start grace period detection.
+var processStartTime = time.Now()
 
 // StartReconcileLoop starts periodic reconciliation.
 // Entry: auto-configure transit/exit outbounds from topology.
@@ -35,7 +39,11 @@ func StartReconcileLoop(meta *Metadata, store *TopoStore, cfClient *CFTopoClient
 	case RoleTransit:
 		reconcileFunc = func() {
 			ReconcileUpstreams(meta, cfClient)
-			downstreams, _ := getTopoFromDualView(meta, store, cfClient)
+			downstreams, degraded := getTopoFromDualView(meta, store, cfClient)
+			if degraded {
+				log.Printf("[reconcile] degraded view, skipping transit config")
+				return
+			}
 			if err := ReconcileTransitConfig(meta, downstreams); err != nil {
 				log.Printf("[reconcile] error: %v", err)
 			}
@@ -52,13 +60,29 @@ func StartReconcileLoop(meta *Metadata, store *TopoStore, cfClient *CFTopoClient
 	}
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[reconcile] goroutine panic: %v — reconciliation stopped", r)
+			}
+		}()
+
 		time.Sleep(10 * time.Second)
 		for {
-			reconcileFunc()
+			safeReconcile(reconcileFunc)
 			time.Sleep(interval)
 		}
 	}()
 	log.Printf("[reconcile] started, role=%s, interval=%s", meta.Role, interval)
+}
+
+// safeReconcile wraps a reconcile function with panic recovery.
+func safeReconcile(fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[reconcile] panic recovered: %v", r)
+		}
+	}()
+	fn()
 }
 
 // getTopoFromDualView reads topology from CF (primary) and local store (fallback).
@@ -106,6 +130,11 @@ func getTopoFromDualView(meta *Metadata, store *TopoStore, cfClient *CFTopoClien
 				continue
 			}
 			if upstreamNames[n.Name] && !localIDs[n.NodeID] {
+				// Cold-start grace: skip ALERT for 10min after process start.
+				// Local store is empty until chain reports arrive (~5min).
+				if time.Since(processStartTime) < 10*time.Minute {
+					continue
+				}
 				log.Printf("[reconcile] ALERT: upstream %s (%s) in CF but not in chain → data-plane break?",
 					n.Name, n.Address)
 			}
@@ -258,12 +287,14 @@ func ReconcileTransitConfig(meta *Metadata, downstreams []TopologyTree) error {
 	}
 
 	// Check if metadata per-exit set changed
+	meta.InboundsMu.RLock()
 	old := map[string]bool{}
 	for _, ib := range meta.Inbounds {
 		if ib.ForExit != "" {
 			old[ib.ForExit] = true
 		}
 	}
+	meta.InboundsMu.RUnlock()
 
 	changed := len(old) != len(desired)
 	if !changed {
@@ -279,12 +310,14 @@ func ReconcileTransitConfig(meta *Metadata, downstreams []TopologyTree) error {
 	}
 
 	// Rebuild inbound metadata: keep main, replace per-exit markers
+	meta.InboundsMu.RLock()
 	var inbounds []InboundMeta
 	for _, ib := range meta.Inbounds {
 		if ib.ForExit == "" {
 			inbounds = append(inbounds, ib)
 		}
 	}
+	meta.InboundsMu.RUnlock()
 	for _, n := range exits {
 		if n.Name == "" {
 			continue
@@ -294,7 +327,9 @@ func ReconcileTransitConfig(meta *Metadata, downstreams []TopologyTree) error {
 			ForExit: n.Name,
 		})
 	}
+	meta.InboundsMu.Lock()
 	meta.Inbounds = inbounds
+	meta.InboundsMu.Unlock()
 
 	log.Printf("[reconcile-transit] exit list updated: %d exits", len(desired))
 	return meta.Save()
@@ -1016,7 +1051,7 @@ func rebuildEntryConfig(currentData []byte, meta *Metadata, transits []TransitIn
 
 	// --- Route: per-exit inbound rules + domain rules + CN/AI/default ---
 	socks5Rule := extractSocks5Rules(config)
-	route := BuildEntryRoute(exits, 0, nil)
+	route := BuildEntryRoute(exits, 0, nil, len(transits))
 
 	// Insert per-exit inbound rules and socks5 rule
 	var perExitRules []interface{}
@@ -1066,12 +1101,15 @@ func validateAndApplyConfig(newData []byte, logPrefix string) error {
 	}
 	defer os.Remove(tmpFile)
 
-	if err := exec.Command("sing-box", "check", "-c", tmpFile).Run(); err != nil {
+	checkCtx, checkCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer checkCancel()
+	if err := exec.CommandContext(checkCtx, "sing-box", "check", "-c", tmpFile).Run(); err != nil {
 		log.Printf("%s validation failed, not applying: %v", logPrefix, err)
 		return err
 	}
 
-	if err := os.WriteFile(ConfigPath(), newData, 0600); err != nil {
+	// Atomic write: rename .tmp → config.json (crash-safe, no partial writes)
+	if err := os.Rename(tmpFile, ConfigPath()); err != nil {
 		return err
 	}
 

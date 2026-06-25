@@ -253,6 +253,7 @@ func EnsureDefaultUser(db *sql.DB, meta *Metadata) error {
 
 	// Extract credentials from metadata inbounds
 	var uuid, password string
+	meta.InboundsMu.RLock()
 	for _, inb := range meta.Inbounds {
 		if inb.Protocol == "vless" && inb.ForExit == "" && inb.UUID != "" {
 			uuid = inb.UUID
@@ -261,6 +262,7 @@ func EnsureDefaultUser(db *sql.DB, meta *Metadata) error {
 			password = inb.Password
 		}
 	}
+	meta.InboundsMu.RUnlock()
 	if uuid == "" || password == "" {
 		return fmt.Errorf("cannot migrate: no vless UUID or hy2 password in metadata inbounds")
 	}

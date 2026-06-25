@@ -86,6 +86,9 @@ type Metadata struct {
 	// UpstreamsMu protects concurrent read/write of Upstreams (reconcile vs topology reporter).
 	UpstreamsMu sync.RWMutex `json:"-"`
 
+	// InboundsMu protects concurrent read/write of Inbounds (reconcile vs topology reporter / HTTP handlers).
+	InboundsMu sync.RWMutex `json:"-"`
+
 	SubPort     int    `json:"sub_port,omitempty"`
 	HTTPSubPort int    `json:"http_sub_port,omitempty"` // optional plaintext HTTP listener for /sub/ (avoids IP-based HTTPS browser warning)
 	APIToken    string `json:"api_token,omitempty"`
@@ -221,7 +224,12 @@ func (m *Metadata) Save() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(MetadataPath(), data, 0600)
+	// Atomic write: write .tmp + rename (crash-safe, no partial writes)
+	tmpPath := MetadataPath() + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, MetadataPath())
 }
 
 // EffectiveHost returns the client-facing host: PublicHost if set, otherwise Domain.
@@ -252,7 +260,7 @@ func SaveConfig(cfg *SBConfig) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(ConfigPath(), data, 0600)
+	return atomicWriteFile(ConfigPath(), data)
 }
 
 // SaveRawConfig saves an arbitrary config (used by entry/client which need richer JSON).
@@ -261,7 +269,16 @@ func SaveRawConfig(cfg interface{}) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(ConfigPath(), data, 0600)
+	return atomicWriteFile(ConfigPath(), data)
+}
+
+// atomicWriteFile writes data to path atomically via .tmp + rename.
+func atomicWriteFile(path string, data []byte) error {
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }
 
 // --- sing-box config structs ---

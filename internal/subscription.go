@@ -27,6 +27,7 @@ func GenerateUserSubscription(user *UserWithTraffic) (string, error) {
 	// --- Main inbounds (auto-routing) ---
 	var mainVlessPbk, mainVlessSid, mainVlessSNI string
 	var mainHy2ObfsPass string
+	meta.InboundsMu.RLock()
 	for _, inb := range meta.Inbounds {
 		if inb.Protocol == "vless" && inb.ForExit == "" {
 			mainVlessPbk = inb.PublicKey
@@ -45,6 +46,7 @@ func GenerateUserSubscription(user *UserWithTraffic) (string, error) {
 				addr, mainHy2ObfsPass, user.Name+"-hy2"))
 		}
 	}
+	meta.InboundsMu.RUnlock()
 
 	// --- Per-exit inbounds (manual exit selection) ---
 	// Sort exit names for stable subscription output

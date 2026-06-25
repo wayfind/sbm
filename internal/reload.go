@@ -58,7 +58,7 @@ func ReloadRoutingPolicy() error {
 	}
 
 	// Rebuild route from policy
-	route := BuildEntryRoute(exits, 0, nil)
+	route := BuildEntryRoute(exits, 0, nil, 1) // assume transits exist during reload
 
 	// Re-insert preserved per-exit and socks5 rules
 	SplicePerExitRules(route, perExitRules, socks5Rule)

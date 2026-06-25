@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"context"
+	"time"
 )
 
 const singboxUnit = `[Unit]
@@ -55,21 +57,31 @@ func InstallSystemdUnits(sbmPath string) error {
 
 func SystemctlOp(op string, units ...string) error {
 	args := append([]string{op}, units...)
-	return RunCmd("systemctl", args...)
+	return RunCmdTimeout(30*time.Second, "systemctl", args...)
 }
 
 func IsActive(unit string) bool {
-	err := exec.Command("systemctl", "is-active", "--quiet", unit).Run()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := exec.CommandContext(ctx, "systemctl", "is-active", "--quiet", unit).Run()
 	return err == nil
 }
 
 func RunCmd(name string, args ...string) error {
-	cmd := exec.Command(name, args...)
+	return RunCmdTimeout(60*time.Second, name, args...)
+}
+
+func RunCmdTimeout(timeout time.Duration, name string, args ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
 
 func RunCmdSilent(name string, args ...string) error {
-	return exec.Command(name, args...).Run()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, name, args...).Run()
 }

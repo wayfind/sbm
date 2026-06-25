@@ -182,7 +182,7 @@ func GenerateEntryConfig(p *EntryParams) (map[string]interface{}, error) {
 	}
 
 	outbounds := BuildEntryOutbounds(p.Transits, p.Exits)
-	route := BuildEntryRoute(p.Exits, p.Socks5Port, p.Socks5DirectIPs)
+	route := BuildEntryRoute(p.Exits, p.Socks5Port, p.Socks5DirectIPs, len(p.Transits))
 
 	dns := map[string]interface{}{
 		"servers": []map[string]interface{}{
@@ -415,7 +415,7 @@ func stickyFirstExit(exitTags []interface{}) string {
 
 // BuildEntryRoute builds the route section for an entry node config.
 // Routing rules come from the routing policy file (or defaults if absent).
-func BuildEntryRoute(exits []ExitInfo, socks5Port int, socks5DirectIPs []string) map[string]interface{} {
+func BuildEntryRoute(exits []ExitInfo, socks5Port int, socks5DirectIPs []string, transitCount int) map[string]interface{} {
 	policy := LoadRoutingPolicy()
 
 	rules := []interface{}{
@@ -434,10 +434,17 @@ func BuildEntryRoute(exits []ExitInfo, socks5Port int, socks5DirectIPs []string)
 		})
 	}
 
+	// When no alive transits exist, fall back to direct instead of routing
+	// to a dead urltest group (which would drop all traffic).
+	finalOutbound := "gia-auto"
+	if transitCount == 0 {
+		finalOutbound = "direct"
+	}
+
 	return map[string]interface{}{
 		"rules":                  rules,
 		"rule_set":               policy.BuildRuleSetDefs(),
-		"final":                  "gia-auto",
+		"final":                  finalOutbound,
 		"auto_detect_interface":  true,
 		"default_domain_resolver": "system",
 	}

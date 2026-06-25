@@ -195,6 +195,11 @@ func getSingBoxVersion() string {
 }
 
 func BuildNodeInfo(meta *Metadata) NodeInfo {
+	meta.InboundsMu.RLock()
+	inbounds := make([]InboundMeta, len(meta.Inbounds))
+	copy(inbounds, meta.Inbounds)
+	meta.InboundsMu.RUnlock()
+
 	info := NodeInfo{
 		NodeID:         meta.NodeID,
 		Name:           meta.Name,
@@ -202,7 +207,7 @@ func BuildNodeInfo(meta *Metadata) NodeInfo {
 		Domain:         meta.Domain,
 		PublicHost:     meta.PublicHost,
 		SubPort:        meta.SubPort,
-		Inbounds:       meta.Inbounds,
+		Inbounds:       inbounds,
 		BWGStatus:      getCachedBWG(),
 		SBMVersion:     Version,
 		SingBoxVersion: getSingBoxVersion(),
@@ -361,13 +366,19 @@ func StartTopologyReporter(meta *Metadata, store *TopoStore, cfClient *CFTopoCli
 	}
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[topology] reporter goroutine unexpected panic: %v", r)
+			}
+		}()
+
 		time.Sleep(5 * time.Second)
-		doReport(meta, store, cfClient, chainClient)
+		safeDoReport(meta, store, cfClient, chainClient)
 
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for range ticker.C {
-			doReport(meta, store, cfClient, chainClient)
+			safeDoReport(meta, store, cfClient, chainClient)
 			store.Prune()
 		}
 	}()
@@ -380,6 +391,17 @@ func StartTopologyReporter(meta *Metadata, store *TopoStore, cfClient *CFTopoCli
 		channels = append(channels, "chain")
 	}
 	log.Printf("[topology] reporter started, interval=%s, channels=%v", interval, channels)
+}
+
+// safeDoReport wraps doReport with panic recovery so the reporter goroutine
+// survives unexpected panics instead of dying silently.
+func safeDoReport(meta *Metadata, store *TopoStore, cfClient *CFTopoClient, chainClient *http.Client) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[topology] doReport panic recovered: %v", r)
+		}
+	}()
+	doReport(meta, store, cfClient, chainClient)
 }
 
 func doReport(meta *Metadata, store *TopoStore, cfClient *CFTopoClient, chainClient *http.Client) {
