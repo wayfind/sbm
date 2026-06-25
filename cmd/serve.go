@@ -193,6 +193,9 @@ func findCertFiles(domain string) (certFile, keyFile string) {
 			{"/etc/letsencrypt/live/" + domain + "/fullchain.pem", "/etc/letsencrypt/live/" + domain + "/privkey.pem"},
 			// Pre-installed (sbm install / manual)
 			{"/root/cert/" + domain + "/fullchain.pem", "/root/cert/" + domain + "/privkey.pem"},
+			// Sing-box ACME under /root (common on non-root or systemd users)
+			{"/root/.local/share/certmagic/certificates/acme-v02.api.letsencrypt.org-directory/" + domain + "/" + domain + ".crt",
+				"/root/.local/share/certmagic/certificates/acme-v02.api.letsencrypt.org-directory/" + domain + "/" + domain + ".key"},
 		}
 		for _, c := range candidates {
 			if _, err := os.Stat(c.cert); err == nil {
@@ -200,7 +203,7 @@ func findCertFiles(domain string) (certFile, keyFile string) {
 			}
 		}
 	}
-	// Sing-box ACME path (certmagic)
+	// Sing-box ACME path (certmagic) — root-level fallback
 	return internal.CertPath(domain), internal.CertKeyPath(domain)
 }
 

@@ -16,7 +16,7 @@ func RunRenew() error {
 		return err
 	}
 
-	certFile := internal.CertPath(meta.Domain)
+	certFile, _ := findCertFiles(meta.Domain)
 	certInfo, err := os.Stat(certFile)
 	if os.IsNotExist(err) {
 		logMsg("证书不存在，尝试签发")
@@ -48,6 +48,32 @@ func RunRenew() error {
 	logMsg("开始续期")
 	internal.FirewallTempAddPort(80, "tcp")
 	defer internal.FirewallTempRemovePort(80, "tcp")
+
+	// For certbot-managed certs, run certbot renew directly.
+	// For sing-box ACME (certmagic), restart sing-box to trigger auto-renew.
+	isCertbot := strings.HasPrefix(certFile, "/etc/letsencrypt/")
+	if isCertbot {
+		out, err := exec.Command("certbot", "renew", "--force-renewal").CombinedOutput()
+		if err != nil {
+			if internal.JSONMode {
+				internal.PrintJSON(map[string]interface{}{
+					"action": "failed", "error": string(out),
+				})
+			} else {
+				logMsg("ERROR: certbot renew failed: %s", string(out))
+			}
+			return nil
+		}
+		days, _ := certDaysLeft(certFile)
+		if internal.JSONMode {
+			internal.PrintJSON(map[string]interface{}{
+				"action": "renewed", "days_remaining": days,
+			})
+		} else {
+			logMsg("续期成功，证书剩余 %d 天", days)
+		}
+		return nil
+	}
 
 	internal.SystemctlOp("restart", "sing-box")
 

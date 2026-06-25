@@ -95,7 +95,7 @@ func RunCert() error {
 	if err != nil {
 		return err
 	}
-	certFile := internal.CertPath(meta.Domain)
+	certFile, _ := findCertFiles(meta.Domain)
 	if _, err := os.Stat(certFile); os.IsNotExist(err) {
 		if internal.JSONMode {
 			internal.PrintJSON(map[string]interface{}{"error": "not_found"})

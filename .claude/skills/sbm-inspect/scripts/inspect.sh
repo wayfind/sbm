@@ -70,6 +70,13 @@ ${sudo_prefix}systemctl show sing-box -p NRestarts 2>/dev/null | cut -d= -f2 | t
 ${sudo_prefix}journalctl -u sbm-server --since "\$SINCE" --no-pager 2>/dev/null | grep -cE 'WARN|ALERT|ERR' | tr -d '\n' | emit SBMWARN
 ${sudo_prefix}journalctl -u sing-box --since "\$SINCE" --no-pager 2>/dev/null | grep -cE 'FATAL|panic' | tr -d '\n' | emit SBFATAL
 ${sudo_prefix}journalctl -u sbm-server --since "\$SINCE" --no-pager 2>/dev/null | grep -E 'WARN|ALERT|ERR' | tail -5 | emit WARNSAMPLE
+# 系统健康维度
+df -h / 2>/dev/null | tail -1 | awk '{print \$5}' | tr -d '%' | tr -d '\n' | emit DISKPCT
+${sudo_prefix}journalctl --disk-usage 2>/dev/null | grep -oP '\d+\.\d+[KMG]' | head -1 | tr -d '\n' | emit JOURNALSIZE
+${sudo_prefix}systemctl --failed --no-legend 2>/dev/null | wc -l | tr -d '\n' | emit FAILEDUNITS
+${sudo_prefix}systemctl --failed --no-legend 2>/dev/null | head -5 | emit FAILEDSAMPLE
+# SSH 暴力破解检测（最近 15 分钟）
+tail -500 /var/log/auth.log 2>/dev/null | grep "Failed password" | grep -c '' | tr -d '\n' | emit SSHFAIL
 echo DONE
 REMOTE
 }
@@ -194,6 +201,16 @@ for name in sorted(node_names):
     except: row['singbox_fatal'] = 0
     row['warn_sample'] = kv.get('WARNSAMPLE', '')
 
+    # 系统健康维度
+    try: row['disk_pct'] = int((kv.get('DISKPCT', '0') or '0').strip())
+    except: row['disk_pct'] = 0
+    row['journal_size'] = kv.get('JOURNALSIZE', '').strip()
+    try: row['failed_units'] = int((kv.get('FAILEDUNITS', '0') or '0').strip())
+    except: row['failed_units'] = 0
+    row['failed_sample'] = kv.get('FAILEDSAMPLE', '')
+    try: row['ssh_fail'] = int((kv.get('SSHFAIL', '0') or '0').strip())
+    except: row['ssh_fail'] = 0
+
     rows.append(row)
 
     # 异常累积
@@ -219,16 +236,25 @@ for name in sorted(node_names):
             if pct < 20:
                 issues.append(f"**{name}**: BWG 剩余带宽 {row['bwg_remaining']}（< 20%）")
         except: pass
+    # 系统健康异常
+    if row['disk_pct'] >= 85:
+        issues.append(f"**{name}**: 磁盘使用 {row['disk_pct']}%（≥ 85%）")
+    if row['failed_units'] > 0:
+        sample = row['failed_sample'].strip().split('\n')[:3]
+        sample_block = '\n'.join('  ' + l for l in sample)
+        issues.append(f"**{name}**: {row['failed_units']} 个 systemd failed units\n  ```\n{sample_block}\n  ```")
+    if row['ssh_fail'] > 20:
+        issues.append(f"**{name}**: 最近 15min SSH 失败登录 {row['ssh_fail']} 次（疑似暴力破解）")
 
 # --- 节点健康表 ---
 print("# sbm 全节点巡检报告\n")
 print(f"时间窗口: 最近 {since_min} 分钟  |  生成时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S %Z')}\n")
 print("## 节点健康\n")
-print("| 节点 | 角色 | sbm | sing-box | restarts | sbm-ver | sb-ver | 证书 | BWG | 用户 | WARN | FATAL |")
-print("|------|------|-----|----------|----------|---------|--------|------|-----|------|------|-------|")
+print("| 节点 | 角色 | sbm | sing-box | restarts | sbm-ver | sb-ver | 证书 | BWG | 用户 | WARN | FATAL | 磁盘 | Failed |")
+print("|------|------|-----|----------|----------|---------|--------|------|-----|------|------|-------|------|--------|")
 for r in rows:
     if not r['reachable']:
-        print(f"| {r['name']} | ? | ❌ | — | — | — | — | — | — | — | — | — |")
+        print(f"| {r['name']} | ? | ❌ | — | — | — | — | — | — | — | — | — | — | — |")
         continue
     parts = r['active'].split()
     sbm_ok = '✅' if (parts and parts[0] == 'active') else '❌'
@@ -236,7 +262,10 @@ for r in rows:
     cert = f"{r['cert_days']}d" if isinstance(r['cert_days'], int) else ''
     warn_cell = '0' if r['sbm_warn'] == 0 else f"⚠️ {r['sbm_warn']}"
     fatal_cell = '0' if r['singbox_fatal'] == 0 else f"🔴 {r['singbox_fatal']}"
-    print(f"| {r['name']} | {r['role']} | {sbm_ok} | {sb_ok} | {r['nrestarts']} | {r['sbm_version']} | {r['singbox_version']} | {cert} | {r['bwg_remaining']} | {r['users']} | {warn_cell} | {fatal_cell} |")
+    disk_cell = f"{r['disk_pct']}%" if r['disk_pct'] else ''
+    if r['disk_pct'] >= 85: disk_cell = f"🔴 {disk_cell}"
+    failed_cell = '0' if r.get('failed_units', 0) == 0 else f"⚠️ {r['failed_units']}"
+    print(f"| {r['name']} | {r['role']} | {sbm_ok} | {sb_ok} | {r['nrestarts']} | {r['sbm_version']} | {r['singbox_version']} | {cert} | {r['bwg_remaining']} | {r['users']} | {warn_cell} | {fatal_cell} | {disk_cell} | {failed_cell} |")
 
 # --- CF /nodes ---
 print("\n## CF 注册表（双控制面）\n")

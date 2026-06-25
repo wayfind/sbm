@@ -31,9 +31,8 @@ declare -A NODE_SSH=(
   [yl]="root@89.208.248.209|22|/usr/local/bin/sbm|systemd"
   [picaospark]="david@175.27.169.180|22|/home/david/sbm|systemd-sudo"
   [lisa]="david@154.37.209.17|22|/usr/local/bin/sbm|systemd-sudo"
-  [yl-lisa]="root@104.247.120.170|14303|/root/sbm|systemd"
   [zgo]="root@23.185.200.18|22|/usr/local/bin/sbm|systemd"
-  [ai-entry]="ubuntu@napi.origintask.cn|22|/usr/local/bin/sbm|systemd-sudo"
+  [ai-entry]="ubuntu@entry.origintask.cn|22|/usr/local/bin/sbm|systemd-sudo"
   [kunshan]="shuzuan@58.211.6.133|104|/usr/local/bin/sbm|systemd-sudo"
 )
 
