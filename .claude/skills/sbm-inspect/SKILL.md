@@ -51,15 +51,22 @@ bash .claude/skills/sbm-inspect/scripts/inspect.sh --since 30
 | sing-box 异常重启 | NRestarts > 0 |
 | sbm-server 告警 | 时间窗口内 WARN/ALERT/ERR > 0（附带最近 5 行样本） |
 | sing-box 致命 | 时间窗口内 FATAL/panic > 0 |
+| sing-box 错误风暴 | 1h 内 ERROR/WARN > 100（排除 mux EOF 噪音） |
+| sing-box 重启 | 24h 内 Started/Stopped > 5 |
 | 证书 | 剩余 < 14 天 |
 | BWG 带宽 | 剩余 < 20% |
+| 内存 | 使用 ≥ 90% |
+| Swap | 使用 > 500MB |
 | CF 上报 | 单节点 reported_at > 6 分钟 |
 | 版本 | 集群存在多个 sbm 版本 |
 
 ## 给读者（Claude）的解读指引
 
 - **报告是给 david 自己看的**，不需要外发。直接把 markdown 完整贴出，再补一句话点评关键发现即可。不要复述表格内容
-- **告警样本里的 ALERT 值得仔细看**：reconcile.go 的 `ALERT: upstream X in CF but not in chain` 是 v2.9.3 之后真实的数据面诊断信号，不是噪音；指向 CF 链路正常但 chain 链路断了
+- **告警样本里的 ALERT 值得仔细看**：reconcile.go 的 `ALERT: upstream X in CF but not in chain` 是 v2.9.3 之后真实的数据面诊断信号，不是噪音；指向 CF 链路正常但 chain 链路断了。但注意：sbm-server 重启后 local store 为空，会持续 ALERT 约 5min 直到下一轮 chain report 到达——这是冷启动误报
+- **WARN: node X in chain but not in CF** 指向有节点通过 chain /report 报上来了但 CF KV 里没有，通常是 CF Worker 写入失败或测试节点残留
+- **sing-box ERROR 里的 `mux connection closed: read frame header: EOF`** 是客户端断连的正常日志，不是异常。`flow mismatch: expected xtls-rprx-vision` 是客户端配置错误（没启用 flow）。`i/o timeout` 到特定 IP 是路由问题。只有当 1h 错误计数 > 100 且不是上述噪音时才值得关注
+- **sing-box 24h 重启 > 5 次** 值得关注：可能是 reconcile 循环频繁写配置导致。检查 `journalctl -u sbm-server | grep 'config updated'`
 - **cert 列为空** 是预期的：transit/exit 节点用预置证书或 s-ui 管理，sbm cert 子命令找不到 ACME 证书，不算异常
 - **BWG 列为空** 也是预期的：BWG 只在搬瓦工 transit（shuzuan/yl/metask）有意义
 - **用户列为空** 也是预期的：user list 只在 entry 有 SQLite

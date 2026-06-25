@@ -77,6 +77,19 @@ ${sudo_prefix}systemctl --failed --no-legend 2>/dev/null | wc -l | tr -d '\n' | 
 ${sudo_prefix}systemctl --failed --no-legend 2>/dev/null | head -5 | emit FAILEDSAMPLE
 # SSH 暴力破解检测（最近 15 分钟）
 tail -500 /var/log/auth.log 2>/dev/null | grep "Failed password" | grep -c '' | tr -d '\n' | emit SSHFAIL
+# sing-box 错误计数（1h）+ 样本
+${sudo_prefix}journalctl -u sing-box --since '1 hour ago' --no-pager 2>/dev/null | grep -ciE 'error|warn|fail|refus|timeout' | tr -d '\n' | emit SBERR1H
+${sudo_prefix}journalctl -u sing-box --since '1 hour ago' --no-pager 2>/dev/null | grep -iE 'error|warn|fail|refus|timeout' | tail -5 | emit SBERRSAMPLE
+# 24h 重启次数
+${sudo_prefix}journalctl -u sing-box --since '24 hours ago' --no-pager 2>/dev/null | grep -c 'Started sing-box' | tr -d '\n' | emit SBRESTARTS24H
+${sudo_prefix}journalctl -u sbm-server --since '24 hours ago' --no-pager 2>/dev/null | grep -c 'Started sbm' | tr -d '\n' | emit SBMRESTARTS24H
+# 内存压力
+free -m 2>/dev/null | awk '/Mem:/ {print int(\$3/\$2*100)}' | tr -d '\n' | emit MEMPCT
+free -m 2>/dev/null | awk '/Swap:/ {print \$3}' | tr -d '\n' | emit SWAPUSED_MB
+# 配置文件新鲜度（最后修改时间戳）
+stat -c %Y /etc/sing-box/config.json 2>/dev/null | tr -d '\n' | emit CONFIG_MTIME
+# sbm-server 日志新鲜度（最后一条日志的时间戳，检测 goroutine 卡死）
+${sudo_prefix}journalctl -u sbm-server --no-pager 2>/dev/null | tail -1 | awk '{print \$1, \$2, \$3}' | tr -d '\n' | emit SBMLASTLOG
 echo DONE
 REMOTE
 }
@@ -211,6 +224,30 @@ for name in sorted(node_names):
     try: row['ssh_fail'] = int((kv.get('SSHFAIL', '0') or '0').strip())
     except: row['ssh_fail'] = 0
 
+    # sing-box 错误计数 (1h)
+    try: row['sb_err_1h'] = int((kv.get('SBERR1H', '0') or '0').strip())
+    except: row['sb_err_1h'] = 0
+    row['sb_err_sample'] = kv.get('SBERRSAMPLE', '')
+
+    # 24h 重启次数
+    try: row['sb_restarts_24h'] = int((kv.get('SBRESTARTS24H', '0') or '0').strip())
+    except: row['sb_restarts_24h'] = 0
+    try: row['sbm_restarts_24h'] = int((kv.get('SBMRESTARTS24H', '0') or '0').strip())
+    except: row['sbm_restarts_24h'] = 0
+
+    # 内存压力
+    try: row['mem_pct'] = int((kv.get('MEMPCT', '0') or '0').strip())
+    except: row['mem_pct'] = 0
+    try: row['swap_used_mb'] = int((kv.get('SWAPUSED_MB', '0') or '0').strip())
+    except: row['swap_used_mb'] = 0
+
+    # 配置新鲜度
+    try: row['config_mtime'] = int(kv.get('CONFIG_MTIME', '0').strip())
+    except: row['config_mtime'] = 0
+
+    # sbm-server 日志新鲜度（检测 goroutine 卡死）
+    row['sbm_lastlog'] = kv.get('SBMLASTLOG', '').strip()
+
     rows.append(row)
 
     # 异常累积
@@ -245,16 +282,52 @@ for name in sorted(node_names):
         issues.append(f"**{name}**: {row['failed_units']} 个 systemd failed units\n  ```\n{sample_block}\n  ```")
     if row['ssh_fail'] > 20:
         issues.append(f"**{name}**: 最近 15min SSH 失败登录 {row['ssh_fail']} 次（疑似暴力破解）")
+    # sing-box 错误异常（排除 mux EOF / connection closed 等客户端断连噪音）
+    if row['sb_err_1h'] > 100:
+        sample = row['sb_err_sample'].strip().split('\n')[:3]
+        sample_block = '\n'.join('  ' + l for l in sample)
+        issues.append(f"**{name}**: sing-box 最近 1h 有 {row['sb_err_1h']} 条 ERROR/WARN\n  ```\n{sample_block}\n  ```")
+    # 重启次数异常
+    if row['sb_restarts_24h'] > 5:
+        issues.append(f"**{name}**: sing-box 24h 内重启 {row['sb_restarts_24h']} 次（不稳定）")
+    if row['sbm_restarts_24h'] > 5:
+        issues.append(f"**{name}**: sbm-server 24h 内重启 {row['sbm_restarts_24h']} 次（不稳定）")
+    # 内存压力
+    if row['mem_pct'] >= 90:
+        issues.append(f"**{name}**: 内存使用 {row['mem_pct']}%（≥ 90%）")
+    if row['swap_used_mb'] > 500:
+        issues.append(f"**{name}**: Swap 使用 {row['swap_used_mb']}MB（> 500MB，内存压力）")
+    # sbm-server 日志停滞（goroutine 卡死检测）
+    if row['sbm_lastlog']:
+        try:
+            # journalctl 日志格式: "Jun 25 10:00:00 hostname ..."
+            # 解析相对时间差
+            import re
+            now = datetime.datetime.now()
+            # 尝试解析 journalctl 默认格式
+            m = re.match(r'(\w{3})\s+(\d+)\s+(\d{2}):(\d{2}):(\d{2})', row['sbm_lastlog'])
+            if m:
+                month_str, day, hh, mm, ss = m.groups()
+                months = {'Jan':1,'Feb':2,'Mar':3,'Apr':4,'May':5,'Jun':6,'Jul':7,'Aug':8,'Sep':9,'Oct':10,'Nov':11,'Dec':12}
+                mon = months.get(month_str, 1)
+                log_time = datetime.datetime(now.year, mon, int(day), int(hh), int(mm), int(ss))
+                # 处理跨年
+                if log_time > now + datetime.timedelta(days=1):
+                    log_time = log_time.replace(year=now.year - 1)
+                age_min = (now - log_time).total_seconds() / 60
+                if age_min > 10:
+                    issues.append(f"**{name}**: sbm-server 最后一条日志在 {int(age_min)}min 前（疑似 goroutine 卡死）")
+        except: pass
 
 # --- 节点健康表 ---
 print("# sbm 全节点巡检报告\n")
 print(f"时间窗口: 最近 {since_min} 分钟  |  生成时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S %Z')}\n")
 print("## 节点健康\n")
-print("| 节点 | 角色 | sbm | sing-box | restarts | sbm-ver | sb-ver | 证书 | BWG | 用户 | WARN | FATAL | 磁盘 | Failed |")
-print("|------|------|-----|----------|----------|---------|--------|------|-----|------|------|-------|------|--------|")
+print("| 节点 | 角色 | sbm | sing-box | restarts | sbm-ver | sb-ver | 证书 | BWG | 用户 | WARN | FATAL | 磁盘 | 内存 | SB-ERR(1h) | 重启(24h) | Failed |")
+print("|------|------|-----|----------|----------|---------|--------|------|-----|------|------|-------|------|------|-----------|----------|--------|")
 for r in rows:
     if not r['reachable']:
-        print(f"| {r['name']} | ? | ❌ | — | — | — | — | — | — | — | — | — | — | — |")
+        print(f"| {r['name']} | ? | ❌ | — | — | — | — | — | — | — | — | — | — | — | — | — | — |")
         continue
     parts = r['active'].split()
     sbm_ok = '✅' if (parts and parts[0] == 'active') else '❌'
@@ -264,8 +337,14 @@ for r in rows:
     fatal_cell = '0' if r['singbox_fatal'] == 0 else f"🔴 {r['singbox_fatal']}"
     disk_cell = f"{r['disk_pct']}%" if r['disk_pct'] else ''
     if r['disk_pct'] >= 85: disk_cell = f"🔴 {disk_cell}"
+    mem_cell = f"{r['mem_pct']}%" if r['mem_pct'] else ''
+    if r['mem_pct'] >= 90: mem_cell = f"🔴 {mem_cell}"
+    sb_err_cell = '0' if r.get('sb_err_1h', 0) <= 5 else f"⚠️ {r['sb_err_1h']}"
+    if r.get('sb_err_1h', 0) > 100: sb_err_cell = f"🔴 {r['sb_err_1h']}"
+    total_restarts = r.get('sb_restarts_24h', 0) + r.get('sbm_restarts_24h', 0)
+    restart_cell = '0' if total_restarts == 0 else f"⚠️ {total_restarts}"
     failed_cell = '0' if r.get('failed_units', 0) == 0 else f"⚠️ {r['failed_units']}"
-    print(f"| {r['name']} | {r['role']} | {sbm_ok} | {sb_ok} | {r['nrestarts']} | {r['sbm_version']} | {r['singbox_version']} | {cert} | {r['bwg_remaining']} | {r['users']} | {warn_cell} | {fatal_cell} | {disk_cell} | {failed_cell} |")
+    print(f"| {r['name']} | {r['role']} | {sbm_ok} | {sb_ok} | {r['nrestarts']} | {r['sbm_version']} | {r['singbox_version']} | {cert} | {r['bwg_remaining']} | {r['users']} | {warn_cell} | {fatal_cell} | {disk_cell} | {mem_cell} | {sb_err_cell} | {restart_cell} | {failed_cell} |")
 
 # --- CF /nodes ---
 print("\n## CF 注册表（双控制面）\n")
