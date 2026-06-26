@@ -368,6 +368,9 @@ func CheckQuotas(db *sql.DB, globalExtra map[string]int64) ([]string, error) {
 			continue
 		}
 		totalBytes := localBytes + globalExtra[name]
+		// Threshold MUST mirror the dashboard's enabled derivation in
+		// cf-worker/src/index.js (GET /api/users): same `total >= quota_gb * 1e9`.
+		// Change one, change both, or the dashboard will misreport quota state.
 		quotaBytes := int64(quotaGB * 1e9)
 		if totalBytes >= quotaBytes {
 			overQuota = append(overQuota, name)

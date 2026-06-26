@@ -901,6 +901,22 @@ async function findEntryNode(env) {
   return https || bases[0];
 }
 
+// listAll exhausts KV list pagination. KV's list() returns at most 1000 keys
+// per call and signals more via list_complete=false + a cursor. Every list site
+// in this Worker must use this — a bare list() silently truncates past 1000
+// keys, which for usage/* would under-count the global quota total with no error
+// (silent data corruption as the node/user count grows).
+async function listAll(kv, opts) {
+  const keys = [];
+  let cursor;
+  do {
+    const r = await kv.list(cursor ? { ...opts, cursor } : opts);
+    for (const k of r.keys) keys.push(k);
+    cursor = r.list_complete ? null : r.cursor;
+  } while (cursor);
+  return keys;
+}
+
 // allEntryBases returns the API base URL of every alive, non-stale entry node.
 // Prefers HTTP for NAT'd nodes that expose http_sub_port: those present a TLS
 // cert whose CN is a borrowed domain (resolves elsewhere), so the Worker can't
@@ -908,9 +924,9 @@ async function findEntryNode(env) {
 // clear (node is behind NAT, request is still BearerAuth'd). Everyone else uses
 // HTTPS on sub_port. host = public_host || domain (NAT nodes need the real IP).
 async function allEntryBases(env) {
-  const list = await env.TOPO_KV.list();
+  const keys = await listAll(env.TOPO_KV);
   const bases = [];
-  for (const key of list.keys) {
+  for (const key of keys) {
     if (key.name.startsWith('user/') || key.name.startsWith('usage/')) continue;
     const val = await env.TOPO_KV.get(key.name);
     if (!val) continue;
@@ -1059,9 +1075,9 @@ export default {
 
     // GET /nodes — list all (skip user/* and usage/* keys)
     if (request.method === 'GET' && path === '/nodes') {
-      const list = await env.TOPO_KV.list();
+      const keys = await listAll(env.TOPO_KV);
       const nodes = [];
-      for (const key of list.keys) {
+      for (const key of keys) {
         if (key.name.startsWith('user/') || key.name.startsWith('usage/')) continue;
         const val = await env.TOPO_KV.get(key.name);
         if (val) {
@@ -1088,9 +1104,9 @@ export default {
 
     // GET /api/usage — list all per-node usage blobs (raw, for debugging/aggregation)
     if (request.method === 'GET' && path === '/api/usage') {
-      const list = await env.TOPO_KV.list({ prefix: 'usage/' });
+      const keys = await listAll(env.TOPO_KV, { prefix: 'usage/' });
       const out = [];
-      for (const key of list.keys) {
+      for (const key of keys) {
         const val = await env.TOPO_KV.get(key.name);
         if (val) {
           try { out.push(JSON.parse(val)); } catch {}
@@ -1125,24 +1141,32 @@ export default {
       const now = new Date();
       const month = now.getUTCFullYear() + '-' + String(now.getUTCMonth() + 1).padStart(2, '0');
 
-      // One list() for the whole KV, classified by prefix in memory, then all
-      // values fetched CONCURRENTLY. Avoids the previous 3×list + serial-get
-      // pattern that multiplied KV subrequests by (users + nodes + usage) and
-      // would intermittently blow the per-request subrequest cap as data grew.
-      const all = await env.TOPO_KV.list();
+      // One paginated list for the whole KV, classified by prefix in memory,
+      // then all values fetched CONCURRENTLY. Avoids the previous 3×list +
+      // serial-get pattern that multiplied KV subrequests by (users+nodes+usage)
+      // and would intermittently blow the per-request subrequest cap as data grew.
+      const allKeys = await listAll(env.TOPO_KV);
       const userKeys = [];
       const usageKeys = [];
       const nodeKeys = [];
-      for (const key of all.keys) {
+      for (const key of allKeys) {
         if (key.name.startsWith('user/')) userKeys.push(key.name);
         else if (key.name.startsWith('usage/')) usageKeys.push(key.name);
         else nodeKeys.push(key.name);
       }
 
+      // allSettled, not all: one flaky KV get must not 500 the whole dashboard.
+      // A failed get becomes null and is skipped below. Caveat: a failed usage
+      // get drops that node's bytes from the sum, so a user's displayed total can
+      // read low during KV trouble. Acceptable here — this is the DISPLAY path;
+      // the authoritative quota decision runs on each entry (CheckQuotas), not here.
+      const getVals = (ks) =>
+        Promise.allSettled(ks.map((k) => env.TOPO_KV.get(k))).then((rs) =>
+          rs.map((r) => (r.status === 'fulfilled' ? r.value : null)));
       const [userVals, usageVals, nodeVals] = await Promise.all([
-        Promise.all(userKeys.map((k) => env.TOPO_KV.get(k))),
-        Promise.all(usageKeys.map((k) => env.TOPO_KV.get(k))),
-        Promise.all(nodeKeys.map((k) => env.TOPO_KV.get(k))),
+        getVals(userKeys),
+        getVals(usageKeys),
+        getVals(nodeKeys),
       ]);
 
       // Sum per-user bytes across all nodes for the current month.
@@ -1197,6 +1221,9 @@ export default {
             sub_urls: subUrls,
             // Quota-view enabled: false when global usage meets/exceeds quota.
             // Manual disables aren't visible to the Worker; dashboard shows quota state.
+            // MUST mirror the threshold in CheckQuotas (internal/users.go): same
+            // `total >= quota_gb * 1e9`. If you change one, change both, or the
+            // dashboard will disagree with what entries actually enforce.
             enabled: !(quotaGB > 0 && bytesTotal >= quotaGB * 1e9),
           });
         } catch {}
@@ -1209,9 +1236,9 @@ export default {
 
     // GET /api/cf-users — list all users
     if (request.method === 'GET' && path === '/api/cf-users') {
-      const list = await env.TOPO_KV.list({ prefix: 'user/' });
+      const keys = await listAll(env.TOPO_KV, { prefix: 'user/' });
       const users = [];
-      for (const key of list.keys) {
+      for (const key of keys) {
         const val = await env.TOPO_KV.get(key.name);
         if (val) {
           try {
