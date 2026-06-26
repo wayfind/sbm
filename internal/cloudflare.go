@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"time"
 )
@@ -213,9 +214,18 @@ func (c *CFTopoClient) GetAllUsage() ([]NodeUsage, error) {
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	// Usage payloads are pure numbers (node_count × user_count). 16 MiB holds
+	// thousands of users across dozens of nodes. If we ever read exactly the cap,
+	// the JSON was almost certainly truncated → Unmarshal fails below, but log
+	// loudly so a silent under-count (truncated usage → looser global quota)
+	// doesn't go unnoticed.
+	const usageCap = 16 << 20
+	body, err := io.ReadAll(io.LimitReader(resp.Body, usageCap))
 	if err != nil {
 		return nil, err
+	}
+	if len(body) == usageCap {
+		log.Printf("[cf] WARNING: usage payload hit %d-byte cap, likely truncated — global quota may under-count", usageCap)
 	}
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("cf get usage status %d", resp.StatusCode)

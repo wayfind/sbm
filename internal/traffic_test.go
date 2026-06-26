@@ -303,6 +303,23 @@ func TestMonthlyRollover(t *testing.T) {
 	}
 }
 
+// TestMonthlyRolloverDBErrorDoesNotClear: a DB read error must NOT be treated as
+// "no record" — otherwise rollover would clear quota_disabled mid-month and
+// release every over-quota user. Simulate the error with a closed DB.
+func TestMonthlyRolloverDBErrorDoesNotClear(t *testing.T) {
+	db := openTestDB(t)
+	db.Exec(`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)`)
+	db.Close() // any query now errors
+
+	rolled, err := MonthlyRollover(db)
+	if err == nil {
+		t.Fatal("expected error from rollover on a closed DB, got nil")
+	}
+	if rolled {
+		t.Fatal("rollover must NOT report success when the DB read failed")
+	}
+}
+
 // TestGetEnabledUsersExcludesQuotaDisabled: served set excludes both manual and
 // quota disables.
 func TestGetEnabledUsersExcludesQuotaDisabled(t *testing.T) {

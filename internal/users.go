@@ -62,6 +62,10 @@ func OpenUsersDB() (*sql.DB, error) {
 			month      TEXT NOT NULL,
 			PRIMARY KEY (user_name, month)
 		);
+		CREATE TABLE IF NOT EXISTS meta (
+			key   TEXT PRIMARY KEY,
+			value TEXT
+		);
 	`)
 	if err != nil {
 		db.Close()
@@ -102,8 +106,13 @@ func columnExists(db *sql.DB, table, column string) bool {
 	return false
 }
 
+// CurrentMonth returns the current month as "YYYY-MM" in UTC. MUST be UTC so it
+// agrees with the CF Worker's aggregation (which uses getUTCMonth). A local-time
+// definition here would diverge from the Worker by the node's UTC offset for the
+// last hours of each month, making the Worker filter out freshly-reported usage
+// as a "future month" and under-count the global quota total.
 func CurrentMonth() string {
-	return time.Now().Format("2006-01")
+	return time.Now().UTC().Format("2006-01")
 }
 
 // AddUser creates a new user with auto-generated credentials.
@@ -395,20 +404,24 @@ func SetQuotaDisabled(db *sql.DB, name string, disabled bool) error {
 // records the last processed month so this runs at most once per month.
 // Returns true if a rollover happened.
 func MonthlyRollover(db *sql.DB) (bool, error) {
-	db.Exec(`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)`)
 	month := CurrentMonth()
 	var last string
-	db.QueryRow(`SELECT value FROM meta WHERE key = 'quota_month'`).Scan(&last)
+	err := db.QueryRow(`SELECT value FROM meta WHERE key = 'quota_month'`).Scan(&last)
+	if err != nil && err != sql.ErrNoRows {
+		// A transient DB error must NOT be treated as "no record" — that would
+		// clear quota_disabled mid-month and release every over-quota user.
+		// Bail out; the next poll retries.
+		return false, fmt.Errorf("rollover read last month: %w", err)
+	}
 	if last == month {
 		return false, nil
 	}
 	if _, err := db.Exec(`UPDATE users SET quota_disabled = 0`); err != nil {
 		return false, err
 	}
-	_, err := db.Exec(
+	if _, err := db.Exec(
 		`INSERT INTO meta (key, value) VALUES ('quota_month', ?)
-		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`, month)
-	if err != nil {
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`, month); err != nil {
 		return false, err
 	}
 	if last != "" {

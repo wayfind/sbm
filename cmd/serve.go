@@ -142,11 +142,21 @@ func RunServe(args []string) error {
 	if meta.HTTPSubPort > 0 && usersDB != nil {
 		httpMux := http.NewServeMux()
 		httpMux.HandleFunc("/sub/", makeUserSubHandler(usersDB))
+		// Also serve the user-management API over HTTP for entry nodes. NAT'd
+		// nodes (kunshan) present a cert whose CN is a domain that resolves
+		// elsewhere, so the CF Worker can't validate TLS when reaching them by
+		// IP — its fan-out writes (enable/reset) fall back to this HTTP port.
+		// Still BearerAuth-protected; the node sits behind NAT.
+		if meta.Role == internal.RoleEntry {
+			apiHandler := internal.BearerAuth(meta.APIToken, makeAPIUsersRouter(usersDB, meta, cfClient))
+			httpMux.HandleFunc("/api/users/", apiHandler)
+			httpMux.HandleFunc("/api/users", apiHandler)
+		}
 		httpSrv = &http.Server{
 			Addr:    fmt.Sprintf(":%d", meta.HTTPSubPort),
 			Handler: stripServerHeader(httpMux),
 		}
-		log.Printf("HTTP subscription listener on :%d (/sub/ only)", meta.HTTPSubPort)
+		log.Printf("HTTP subscription listener on :%d (/sub/ + /api/users)", meta.HTTPSubPort)
 	}
 
 	// Graceful shutdown on SIGINT/SIGTERM

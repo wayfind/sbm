@@ -47,6 +47,12 @@ func FetchAndRecordTraffic(client *StatsClient, db *sql.DB, cfClient *CFTopoClie
 	for user, cur := range current {
 		prev := tracker.prev[user]
 		if prev == nil {
+			// No baseline yet (first poll, or just after a reset cleared it via
+			// ResetTrackerUser). Establish the baseline from the current
+			// cumulative counter and skip this round. Note: traffic accrued
+			// between a reset and this next poll (~one interval) is intentionally
+			// dropped — the counter isn't restarted on reset, so we can't tell
+			// pre- from post-reset bytes. Bounded by the poll interval, harmless.
 			tracker.prev[user] = &V2RayUserTraffic{Uplink: cur.Uplink, Downlink: cur.Downlink}
 			continue
 		}
@@ -86,6 +92,17 @@ func FetchAndRecordTraffic(client *StatsClient, db *sql.DB, cfClient *CFTopoClie
 
 	// Report this node's usage to CF and aggregate other nodes' usage for the
 	// global quota total. CF failures degrade to local-only enforcement.
+	//
+	// Consistency model: each entry owns one usage/{node_id} key (single writer,
+	// no write conflicts). The global total is the sum across keys, read with
+	// CF KV's eventual consistency (~seconds lag). This is correct as long as
+	// usage only ever GROWS within a month. The two operations that DECREASE a
+	// node's contribution — reset and monthly rollover — must therefore be
+	// applied consistently across ALL entries (the Worker fans reset out to every
+	// node; rollover keys off CurrentMonth so every node flips on the same UTC
+	// boundary). A reset that succeeds on some nodes but not others leaves the
+	// global total transiently inflated until the next poll re-reports; the
+	// Worker surfaces such partial failures as HTTP 207 rather than hiding them.
 	var globalExtra map[string]int64
 	if cfClient != nil && nodeID != "" {
 		if usage, uErr := GetMonthUsage(db, month); uErr == nil {

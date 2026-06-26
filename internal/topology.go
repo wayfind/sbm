@@ -75,6 +75,7 @@ type NodeInfo struct {
 	PublicHost     string        `json:"public_host,omitempty"`
 	Address        string        `json:"address,omitempty"`
 	SubPort        int           `json:"sub_port,omitempty"`
+	HTTPSubPort    int           `json:"http_sub_port,omitempty"`
 	Inbounds       []InboundMeta `json:"inbounds,omitempty"`
 	BWGStatus      *BWGStatus    `json:"bwg_status,omitempty"`
 	SBMVersion     string        `json:"sbm_version,omitempty"`
@@ -227,6 +228,7 @@ func BuildNodeInfo(meta *Metadata) NodeInfo {
 		Domain:         meta.Domain,
 		PublicHost:     meta.PublicHost,
 		SubPort:        meta.SubPort,
+		HTTPSubPort:    meta.HTTPSubPort,
 		Inbounds:       inbounds,
 		BWGStatus:      getCachedBWG(),
 		SBMVersion:     Version,

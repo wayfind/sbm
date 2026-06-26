@@ -339,7 +339,16 @@ function apiCall(method, path, body) {
     opts.headers['Content-Type'] = 'application/json';
     opts.body = JSON.stringify(body);
   }
-  return fetch(path, opts).then(function(r) { return r.json(); });
+  return fetch(path, opts).then(function(r) {
+    return r.json().catch(function() { return {}; }).then(function(data) {
+      // 2xx including 207 multi-status from fan-out. A 207 means SOME entries
+      // failed — reject so callers can alert instead of silently pretending OK.
+      if (r.status >= 200 && r.status < 207) return data;
+      var msg = data && data.error ? data.error : ('HTTP ' + r.status);
+      if (data && data.failed) msg += ' — 失败节点: ' + data.failed.join(', ');
+      return Promise.reject(new Error(msg));
+    });
+  });
 }
 
 /* === Header stats === */
@@ -768,17 +777,22 @@ function editQuota(name, currentQuota) {
   // Update CF registry — entry nodes will sync automatically
   apiCall('PUT', '/api/cf-users/' + name, { quota_gb: parseFloat(q) || 0 }).then(function() {
     loadUsers();
-  });
+  }).catch(function(e) { alert('配额更新失败: ' + e.message); });
 }
 
 function toggleUser(name, currentEnabled) {
-  // enabled is per-entry local state, proxy to entry node
-  apiCall('PUT', '/api/users/' + name, { enabled: !currentEnabled }).then(function() { loadUsers(); });
+  // Fans out to ALL entries; a 207 (some entries failed) rejects here so the
+  // operator is told rather than left thinking it worked everywhere.
+  apiCall('PUT', '/api/users/' + name, { enabled: !currentEnabled })
+    .then(function() { loadUsers(); })
+    .catch(function(e) { alert('操作未在所有节点生效: ' + e.message); loadUsers(); });
 }
 
 function resetTraffic(name) {
   if (!confirm('重置 ' + name + ' 的本月流量并启用？')) return;
-  apiCall('POST', '/api/users/' + name + '/reset').then(function() { loadUsers(); });
+  apiCall('POST', '/api/users/' + name + '/reset')
+    .then(function() { loadUsers(); })
+    .catch(function(e) { alert('重置未在所有节点生效: ' + e.message); loadUsers(); });
 }
 
 /* === Tab 3: Rules === */
@@ -877,12 +891,22 @@ setInterval(loadUsers, 30000);
 </script></body></html>`;
 
 // --- Helper: find entry node from TOPO_KV ---
+// Prefer a full HTTPS entry: the single-node proxy serves all /api/* paths, but
+// HTTP-only NAT nodes register just /api/users — picking one would 404 other
+// endpoints (e.g. /api/config/rules). Fall back to any base if none are HTTPS.
 async function findEntryNode(env) {
   const bases = await allEntryBases(env);
-  return bases.length ? bases[0] : null;
+  if (!bases.length) return null;
+  const https = bases.find((b) => b.startsWith('https://'));
+  return https || bases[0];
 }
 
-// allEntryBases returns the base URL of every alive, non-stale entry node.
+// allEntryBases returns the API base URL of every alive, non-stale entry node.
+// Prefers HTTP for NAT'd nodes that expose http_sub_port: those present a TLS
+// cert whose CN is a borrowed domain (resolves elsewhere), so the Worker can't
+// validate HTTPS to them by IP. http_sub_port lets fan-out reach them in the
+// clear (node is behind NAT, request is still BearerAuth'd). Everyone else uses
+// HTTPS on sub_port. host = public_host || domain (NAT nodes need the real IP).
 async function allEntryBases(env) {
   const list = await env.TOPO_KV.list();
   const bases = [];
@@ -895,43 +919,60 @@ async function allEntryBases(env) {
       if (node.role === 'entry' && node.alive !== false) {
         const ageMs = Date.now() - new Date(node.reported_at).getTime();
         if (ageMs > 20 * 60 * 1000) continue; // skip stale
-        const port = node.sub_port || 20033;
-        bases.push(`https://${node.domain}:${port}`);
+        const host = node.public_host || node.domain;
+        if (!host) continue;
+        if (node.public_host && node.http_sub_port) {
+          // NAT node with HTTP API — avoid the unverifiable cert.
+          bases.push(`http://${host}:${node.http_sub_port}`);
+        } else {
+          bases.push(`https://${host}:${node.sub_port || 20033}`);
+        }
       }
     } catch {}
   }
   return bases;
 }
 
-// fanOutToEntries broadcasts a write (PUT/POST/DELETE) to ALL entry nodes, so
-// per-entry local state (enabled, quota_disabled, traffic) stays consistent
-// across the cluster. Returns the last node's parsed JSON (all nodes get the
-// same mutation, so any response body is representative). Errors on individual
-// nodes are collected but do not abort the others.
+// fanOutToEntries broadcasts a write (PUT/POST/DELETE) to ALL entry nodes in
+// PARALLEL, so per-entry local state (enabled, quota_disabled, traffic) stays
+// consistent across the cluster. A partial failure is NOT a success: it leaves
+// the user enabled on some nodes and disabled on others. So we only report 200
+// when EVERY node succeeded; any failure returns 207 with the failing nodes
+// listed, so the caller (and the operator) sees the inconsistency instead of a
+// reassuring-but-false 200.
 async function fanOutToEntries(env, method, path, apiKey, bodyText) {
   const bases = await allEntryBases(env);
   if (!bases.length) {
     return { ok: false, status: 502, body: { error: 'no entry node available' } };
   }
+  const headers = { 'Authorization': 'Bearer ' + apiKey };
+  if (bodyText) headers['Content-Type'] = 'application/json';
+
+  const settled = await Promise.allSettled(
+    bases.map((base) => fetch(base + path, { method, headers, body: bodyText || undefined }))
+  );
+
   let lastBody = { status: 'ok' };
-  let anyOk = false;
   const errors = [];
-  for (const base of bases) {
-    try {
-      const headers = { 'Authorization': 'Bearer ' + apiKey };
-      if (bodyText) headers['Content-Type'] = 'application/json';
-      const resp = await fetch(base + path, { method, headers, body: bodyText || undefined });
-      if (resp.ok) {
-        anyOk = true;
-        try { lastBody = await resp.json(); } catch {}
-      } else {
-        errors.push(`${base}:${resp.status}`);
-      }
-    } catch (e) {
-      errors.push(`${base}:${String(e)}`);
+  for (let i = 0; i < settled.length; i++) {
+    const s = settled[i];
+    if (s.status === 'fulfilled' && s.value.ok) {
+      try { lastBody = await s.value.json(); } catch {}
+    } else {
+      const reason = s.status === 'fulfilled' ? `${s.value.status}` : String(s.reason);
+      errors.push(`${bases[i]}:${reason}`);
     }
   }
-  return { ok: anyOk, status: anyOk ? 200 : 502, body: lastBody, errors };
+
+  if (errors.length === 0) {
+    return { ok: true, status: 200, body: lastBody };
+  }
+  // Partial or total failure — surface which nodes failed, never a bare 200.
+  return {
+    ok: false,
+    status: errors.length === bases.length ? 502 : 207,
+    body: { error: 'fan-out incomplete', failed: errors, ok_count: bases.length - errors.length },
+  };
 }
 
 // --- Helper: proxy request to entry node ---
