@@ -13,7 +13,16 @@ import (
 
 const (
 	DeployDir = "/etc/sing-box"
-	CertBase  = "/.local/share/certmagic/certificates/acme-v02.api.letsencrypt.org-directory"
+	// CertDir is the unified, HOME-independent cert location. All nodes serve
+	// hy2 + the subscription HTTPS from here so sing-box and sbm-server read the
+	// same files. Avoids certmagic's $HOME-derived path (which drifted on metask
+	// and expired the cert). kunshan already uses this layout.
+	CertDir            = DeployDir + "/cert"
+	UnifiedCertPath    = CertDir + "/fullchain.pem"
+	UnifiedCertKeyPath = CertDir + "/privkey.pem"
+	// CertBase: legacy certmagic store (HOME=/ form). Kept only as a findCertFiles
+	// fallback for not-yet-migrated ACME nodes; superseded by the unified path.
+	CertBase = "/.local/share/certmagic/certificates/acme-v02.api.letsencrypt.org-directory"
 )
 
 func ConfigPath() string   { return filepath.Join(DeployDir, "config.json") }
@@ -376,6 +385,7 @@ type InstallParams struct {
 	ObfsPass   string
 	CertFile   string // certbot certificate path (alternative to ACME)
 	KeyFile    string // certbot key path
+	UseACME    bool   // opt-in: use sing-box ACME (certmagic) instead of the unified cert path
 	Socks5Port int
 	Socks5User string
 	Socks5Pass string

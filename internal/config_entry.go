@@ -16,6 +16,7 @@ type EntryParams struct {
 	// TLS certificate files (alternative to ACME, e.g. certbot-managed)
 	CertFile string // path to fullchain.pem
 	KeyFile  string // path to privkey.pem
+	UseACME  bool   // opt-in: use sing-box ACME (certmagic) instead of the unified cert path
 
 	// Crypto materials for client-facing inbounds
 	UUID       string
@@ -145,16 +146,23 @@ func GenerateEntryConfig(p *EntryParams) (map[string]interface{}, error) {
 			"alpn":    []string{"h3"},
 		}
 		if p.CertFile != "" {
-			// Use external certificate (e.g. certbot)
+			// Explicit external certificate (e.g. certbot)
 			hy2TLS["certificate_path"] = p.CertFile
 			hy2TLS["key_path"] = p.KeyFile
 			if p.Domain != "" {
 				hy2TLS["server_name"] = p.Domain
 			}
-		} else {
-			// Use ACME (sing-box auto-manages cert)
+		} else if p.UseACME {
+			// Opt-in: sing-box ACME (certmagic). HOME-dependent — avoid unless needed.
 			rootDomain := ExtractRootDomain(p.Domain)
 			hy2TLS["acme"] = map[string]interface{}{"domain": []string{p.Domain}, "email": "admin@" + rootDomain}
+		} else {
+			// Default: unified cert path, shared with sbm-server, HOME-independent.
+			hy2TLS["certificate_path"] = UnifiedCertPath
+			hy2TLS["key_path"] = UnifiedCertKeyPath
+			if p.Domain != "" {
+				hy2TLS["server_name"] = p.Domain
+			}
 		}
 		inbounds = append(inbounds, map[string]interface{}{
 			"type": "hysteria2", "tag": "hy2-in",

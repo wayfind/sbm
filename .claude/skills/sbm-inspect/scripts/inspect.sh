@@ -83,6 +83,10 @@ ${sudo_prefix}journalctl -u sing-box --since '1 hour ago' --no-pager 2>/dev/null
 # 24h 重启次数
 ${sudo_prefix}journalctl -u sing-box --since '24 hours ago' --no-pager 2>/dev/null | grep -c 'Started sing-box' | tr -d '\n' | emit SBRESTARTS24H
 ${sudo_prefix}journalctl -u sbm-server --since '24 hours ago' --no-pager 2>/dev/null | grep -c 'Started sbm' | tr -d '\n' | emit SBMRESTARTS24H
+# 24h 异常退出次数(区分 deploy 重启 vs crash-loop): systemd 非零退出/被信号杀/panic。
+# 干净的 deploy stop/start 不会留这些痕迹，只有真崩溃才会。
+${sudo_prefix}journalctl -u sbm-server --since '24 hours ago' --no-pager 2>/dev/null | grep -cE 'code=exited, status=[1-9]|code=killed|panic:|signal: ' | tr -d '\n' | emit SBMABNORMAL24H
+${sudo_prefix}journalctl -u sing-box --since '24 hours ago' --no-pager 2>/dev/null | grep -cE 'code=exited, status=[1-9]|code=killed|panic:|signal: ' | tr -d '\n' | emit SBABNORMAL24H
 # 内存压力
 free -m 2>/dev/null | awk '/Mem:/ {print int(\$3/\$2*100)}' | tr -d '\n' | emit MEMPCT
 free -m 2>/dev/null | awk '/Swap:/ {print \$3}' | tr -d '\n' | emit SWAPUSED_MB
@@ -232,6 +236,11 @@ for name in sorted(node_names):
     except: row['sb_restarts_24h'] = 0
     try: row['sbm_restarts_24h'] = int((kv.get('SBMRESTARTS24H', '0') or '0').strip())
     except: row['sbm_restarts_24h'] = 0
+    # 异常退出计数(crash 信号),用于区分 deploy 重启 vs crash-loop
+    try: row['sbm_abnormal_24h'] = int((kv.get('SBMABNORMAL24H', '0') or '0').strip())
+    except: row['sbm_abnormal_24h'] = 0
+    try: row['sb_abnormal_24h'] = int((kv.get('SBABNORMAL24H', '0') or '0').strip())
+    except: row['sb_abnormal_24h'] = 0
 
     # 内存压力
     try: row['mem_pct'] = int((kv.get('MEMPCT', '0') or '0').strip())
@@ -282,11 +291,18 @@ for name in sorted(node_names):
         sample = row['sb_err_sample'].strip().split('\n')[:3]
         sample_block = '\n'.join('  ' + l for l in sample)
         issues.append(f"**{name}**: sing-box 最近 1h 有 {row['sb_err_1h']} 条 ERROR/WARN\n  ```\n{sample_block}\n  ```")
-    # 重启次数异常
+    # 重启次数异常：只在伴随异常退出(crash)时告警。干净的 deploy stop/start 也会
+    # 抬高重启计数，但不留 crash 痕迹——那种不告警，否则每次部署后都狼来了，真 crash-loop 反被忽略。
     if row['sb_restarts_24h'] > 5:
-        issues.append(f"**{name}**: sing-box 24h 内重启 {row['sb_restarts_24h']} 次（不稳定）")
+        if row.get('sb_abnormal_24h', 0) > 0:
+            issues.append(f"**{name}**: sing-box 24h 重启 {row['sb_restarts_24h']} 次且有 {row['sb_abnormal_24h']} 次异常退出（疑似 crash-loop）")
+        else:
+            issues.append(f"**{name}**: sing-box 24h 重启 {row['sb_restarts_24h']} 次但无异常退出（疑为部署触发，非故障）")
     if row['sbm_restarts_24h'] > 5:
-        issues.append(f"**{name}**: sbm-server 24h 内重启 {row['sbm_restarts_24h']} 次（不稳定）")
+        if row.get('sbm_abnormal_24h', 0) > 0:
+            issues.append(f"**{name}**: sbm-server 24h 重启 {row['sbm_restarts_24h']} 次且有 {row['sbm_abnormal_24h']} 次异常退出（疑似 crash-loop）")
+        else:
+            issues.append(f"**{name}**: sbm-server 24h 重启 {row['sbm_restarts_24h']} 次但无异常退出（疑为部署触发，非故障）")
     # 内存压力
     if row['mem_pct'] >= 90:
         issues.append(f"**{name}**: 内存使用 {row['mem_pct']}%（≥ 90%）")

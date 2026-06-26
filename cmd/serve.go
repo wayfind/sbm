@@ -199,6 +199,10 @@ func stripServerHeader(next http.Handler) http.Handler {
 func findCertFiles(domain string) (certFile, keyFile string) {
 	if domain != "" {
 		candidates := []struct{ cert, key string }{
+			// Unified path (highest priority, the cross-node standard). Fixed
+			// filenames, no domain subdir. Absent → os.Stat fails → next candidate,
+			// so nodes still on certbot/root-cert are unaffected.
+			{internal.UnifiedCertPath, internal.UnifiedCertKeyPath},
 			// Certbot
 			{"/etc/letsencrypt/live/" + domain + "/fullchain.pem", "/etc/letsencrypt/live/" + domain + "/privkey.pem"},
 			// Pre-installed (sbm install / manual)

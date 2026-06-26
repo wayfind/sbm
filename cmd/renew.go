@@ -49,9 +49,12 @@ func RunRenew() error {
 	internal.FirewallTempAddPort(80, "tcp")
 	defer internal.FirewallTempRemovePort(80, "tcp")
 
-	// For certbot-managed certs, run certbot renew directly.
-	// For sing-box ACME (certmagic), restart sing-box to trigger auto-renew.
-	isCertbot := strings.HasPrefix(certFile, "/etc/letsencrypt/")
+	// Renewal routing by who MANAGES the domain, not by the served cert path.
+	// findCertFiles now returns the unified /etc/sing-box/cert path first, so the
+	// old HasPrefix(certFile,"/etc/letsencrypt/") check would wrongly skip certbot.
+	// certbot's deploy-hook keeps /etc/sing-box/cert in sync after renewal.
+	_, certbotErr := os.Stat("/etc/letsencrypt/live/" + meta.Domain)
+	isCertbot := certbotErr == nil
 	if isCertbot {
 		out, err := exec.Command("certbot", "renew", "--force-renewal").CombinedOutput()
 		if err != nil {

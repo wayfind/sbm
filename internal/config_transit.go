@@ -6,7 +6,7 @@ package internal
 func GenerateTransitConfig(p *InstallParams) *SBConfig {
 	ignoreBW := true
 
-	// Hy2 TLS: prefer certbot certificate over ACME
+	// Hy2 TLS: default to the unified cert path; certbot file or ACME on opt-in.
 	hy2TLS := &SBTLS{
 		Enabled: true,
 		ALPN:    []string{"h3"},
@@ -17,9 +17,15 @@ func GenerateTransitConfig(p *InstallParams) *SBConfig {
 		if p.Domain != "" {
 			hy2TLS.ServerName = p.Domain
 		}
-	} else {
+	} else if p.UseACME {
 		rootDomain := ExtractRootDomain(p.Domain)
 		hy2TLS.ACME = &SBACME{Domain: []string{p.Domain}, Email: "admin@" + rootDomain}
+	} else {
+		hy2TLS.CertificatePath = UnifiedCertPath
+		hy2TLS.KeyPath = UnifiedCertKeyPath
+		if p.Domain != "" {
+			hy2TLS.ServerName = p.Domain
+		}
 	}
 
 	return &SBConfig{

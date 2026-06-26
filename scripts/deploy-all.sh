@@ -36,7 +36,10 @@ declare -A NODE_SSH=(
   [kunshan]="shuzuan@58.211.6.133|104|/usr/local/bin/sbm|systemd-sudo"
 )
 
-SSH_OPTS="-o ConnectTimeout=10 -o ServerAliveInterval=60 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=no"
+# ConnectTimeout caps TCP connect; ServerAlive caps a HANG AFTER connect (a stuck
+# remote sudo/systemctl) at ~15s (3×5s) instead of the default 180s that used to
+# freeze whole-fleet pre-flight when one node's remote command stalled.
+SSH_OPTS="-o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=no -o BatchMode=yes"
 
 # --- Parse args ---
 SKIP_BUILD=0
@@ -70,9 +73,15 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# TIMEOUT: hard wall-clock cap on each remote command, belt-and-suspenders on top
+# of ServerAlive (which can fail to fire on some NATs). Prefer GNU timeout if present.
+if command -v timeout >/dev/null 2>&1; then TIMEOUT="timeout 25";
+elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT="gtimeout 25";
+else TIMEOUT=""; fi
+
 do_ssh() {
   local target="$1" port="$2"; shift 2
-  ssh $SSH_OPTS -p "$port" $target "$@"
+  $TIMEOUT ssh $SSH_OPTS -p "$port" $target "$@"
 }
 
 # --- Build deploy list ---
