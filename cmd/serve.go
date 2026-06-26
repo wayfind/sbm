@@ -404,11 +404,21 @@ func makeAPIUsersRouter(db *sql.DB, meta *internal.Metadata, cfClient *internal.
 			internal.SetUserEnabled(db, name, true)
 			internal.SetQuotaDisabled(db, name, false)
 			// Immediately re-report this node's usage so the CF aggregate drops
-			// this user's old bytes right away (don't wait for the next poll).
+			// this user's old bytes right away (don't wait for the next ~30s poll).
+			// This writes the same usage/{node_id} key the traffic collector
+			// writes; the two are last-writer-wins. That's safe here — both read
+			// the same SQLite, so whichever lands last carries equivalent data;
+			// the reset already cleared this user's row, so neither can resurrect
+			// the old bytes. On error we log but still return success: the next
+			// poll will re-report, only the immediacy is lost.
 			if cfClient != nil {
 				month := internal.CurrentMonth()
 				if usage, uErr := internal.GetMonthUsage(db, month); uErr == nil {
-					cfClient.ReportUsage(meta.NodeID, month, usage)
+					if rErr := cfClient.ReportUsage(meta.NodeID, month, usage); rErr != nil {
+						log.Printf("[api] reset %s: re-report usage failed (next poll will fix): %v", name, rErr)
+					}
+				} else {
+					log.Printf("[api] reset %s: read usage failed: %v", name, uErr)
 				}
 			}
 			user, err := internal.GetUser(db, name)

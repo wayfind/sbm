@@ -341,8 +341,8 @@ function apiCall(method, path, body) {
   }
   return fetch(path, opts).then(function(r) {
     return r.json().catch(function() { return {}; }).then(function(data) {
-      // 2xx including 207 multi-status from fan-out. A 207 means SOME entries
-      // failed — reject so callers can alert instead of silently pretending OK.
+      // 200–206 = clean success. 207 (fan-out partial failure) and any other
+      // status → reject, so the UI alerts instead of silently pretending OK.
       if (r.status >= 200 && r.status < 207) return data;
       var msg = data && data.error ? data.error : ('HTTP ' + r.status);
       if (data && data.failed) msg += ' — 失败节点: ' + data.failed.join(', ');
@@ -952,12 +952,14 @@ async function fanOutToEntries(env, method, path, apiKey, bodyText) {
     bases.map((base) => fetch(base + path, { method, headers, body: bodyText || undefined }))
   );
 
-  let lastBody = { status: 'ok' };
   const errors = [];
   for (let i = 0; i < settled.length; i++) {
     const s = settled[i];
     if (s.status === 'fulfilled' && s.value.ok) {
-      try { lastBody = await s.value.json(); } catch {}
+      // Drain the body so the connection is released; we don't use it — every
+      // node applies the same mutation, so there's no single "representative"
+      // response worth returning.
+      try { await s.value.text(); } catch {}
     } else {
       const reason = s.status === 'fulfilled' ? `${s.value.status}` : String(s.reason);
       errors.push(`${bases[i]}:${reason}`);
@@ -965,7 +967,7 @@ async function fanOutToEntries(env, method, path, apiKey, bodyText) {
   }
 
   if (errors.length === 0) {
-    return { ok: true, status: 200, body: lastBody };
+    return { ok: true, status: 200, body: { status: 'ok', node_count: bases.length } };
   }
   // Partial or total failure — surface which nodes failed, never a bare 200.
   return {
@@ -1123,11 +1125,29 @@ export default {
       const now = new Date();
       const month = now.getUTCFullYear() + '-' + String(now.getUTCMonth() + 1).padStart(2, '0');
 
+      // One list() for the whole KV, classified by prefix in memory, then all
+      // values fetched CONCURRENTLY. Avoids the previous 3×list + serial-get
+      // pattern that multiplied KV subrequests by (users + nodes + usage) and
+      // would intermittently blow the per-request subrequest cap as data grew.
+      const all = await env.TOPO_KV.list();
+      const userKeys = [];
+      const usageKeys = [];
+      const nodeKeys = [];
+      for (const key of all.keys) {
+        if (key.name.startsWith('user/')) userKeys.push(key.name);
+        else if (key.name.startsWith('usage/')) usageKeys.push(key.name);
+        else nodeKeys.push(key.name);
+      }
+
+      const [userVals, usageVals, nodeVals] = await Promise.all([
+        Promise.all(userKeys.map((k) => env.TOPO_KV.get(k))),
+        Promise.all(usageKeys.map((k) => env.TOPO_KV.get(k))),
+        Promise.all(nodeKeys.map((k) => env.TOPO_KV.get(k))),
+      ]);
+
       // Sum per-user bytes across all nodes for the current month.
       const totals = {}; // name -> bytes_total
-      const usageList = await env.TOPO_KV.list({ prefix: 'usage/' });
-      for (const key of usageList.keys) {
-        const val = await env.TOPO_KV.get(key.name);
+      for (const val of usageVals) {
         if (!val) continue;
         try {
           const nu = JSON.parse(val);
@@ -1139,16 +1159,12 @@ export default {
         } catch {}
       }
 
-      // Collect entry sub-URL bases (host:port) to build per-user subscription
-      // links, mirroring the entry-side buildSubURLs (host = public_host||domain,
-      // port = sub_port||20033). Built here so links survive any single entry
-      // being offline, and so this aggregated handler keeps the per-entry sub
-      // links the old single-node proxy used to return.
+      // Entry sub-URL bases (host:port), mirroring entry-side buildSubURLs
+      // (host = public_host||domain, port = sub_port||20033). Built here so links
+      // survive any single entry being offline and the aggregated handler keeps
+      // the per-entry sub links the old single-node proxy used to return.
       const subBases = []; // [{host, port}]
-      const nodeList = await env.TOPO_KV.list();
-      for (const key of nodeList.keys) {
-        if (key.name.startsWith('user/') || key.name.startsWith('usage/')) continue;
-        const val = await env.TOPO_KV.get(key.name);
+      for (const val of nodeVals) {
         if (!val) continue;
         try {
           const n = JSON.parse(val);
@@ -1158,16 +1174,15 @@ export default {
           subBases.push({ host: host, port: n.sub_port || 20033 });
         } catch {}
       }
-      subBases.sort((a, b) => (a.host + a.port).localeCompare(b.host + b.port));
+      subBases.sort((a, b) => a.host.localeCompare(b.host));
 
-      const userList = await env.TOPO_KV.list({ prefix: 'user/' });
       const users = [];
-      for (const key of userList.keys) {
-        const val = await env.TOPO_KV.get(key.name);
+      for (let i = 0; i < userKeys.length; i++) {
+        const val = userVals[i];
         if (!val) continue;
         try {
           const u = JSON.parse(val);
-          const name = key.name.slice(5); // strip "user/" prefix
+          const name = userKeys[i].slice(5); // strip "user/" prefix
           const bytesTotal = totals[name] || 0;
           const quotaGB = u.quota_gb || 0;
           const subUrls = subBases.map(function (b) {
