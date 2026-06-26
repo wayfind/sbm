@@ -173,6 +173,26 @@ func getCachedBWG() *BWGStatus {
 	return &cp
 }
 
+// startBWGCacheRefresher runs a goroutine that periodically refreshes the BWG
+// cache independently of the topology reporter. This prevents slow BWG API
+// responses from blocking or delaying topology reports.
+func startBWGCacheRefresher(cfg *BWGConfig) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[topology] BWG cache refresher panic: %v", r)
+		}
+	}()
+
+	// Initial fetch immediately so the cache is populated ASAP.
+	refreshBWGCache(cfg)
+
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		refreshBWGCache(cfg)
+	}
+}
+
 // --- Build self NodeInfo from metadata ---
 
 // cachedSingBoxVersion is detected once at first use.
@@ -355,6 +375,13 @@ func StartTopologyReporter(meta *Metadata, store *TopoStore, cfClient *CFTopoCli
 		return
 	}
 
+	// BWG cache refresh runs in its own goroutine so slow BWG API responses
+	// don't block topology reporting. The cache is read by BuildNodeInfo via
+	// getCachedBWG (lock-protected, nil-safe until first successful fetch).
+	if meta.BWG != nil {
+		go startBWGCacheRefresher(meta.BWG)
+	}
+
 	var chainClient *http.Client
 	if hasChain {
 		chainClient = &http.Client{
@@ -405,10 +432,8 @@ func safeDoReport(meta *Metadata, store *TopoStore, cfClient *CFTopoClient, chai
 }
 
 func doReport(meta *Metadata, store *TopoStore, cfClient *CFTopoClient, chainClient *http.Client) {
-	// Refresh BWG cache first (non-blocking: updates cache, tolerates failure)
-	if meta.BWG != nil {
-		refreshBWGCache(meta.BWG)
-	}
+	// BWG cache is refreshed by a dedicated goroutine (startBWGCacheRefresher),
+	// not here — avoids blocking reports when BWG API is slow.
 
 	// Channel A: Cloudflare KV (flat NodeInfo)
 	if cfClient != nil {

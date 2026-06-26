@@ -624,13 +624,13 @@ func assignExitPorts(meta *Metadata, exits []ExitInfo) bool {
 			log.Printf("[reconcile] assigned socks5 port %d for exit %s", port, e.Name)
 		}
 		if _, exists := meta.ExitVlessPorts[e.Name]; !exists {
-			port := AllocatePort(20100, 20300, meta.ExitVlessPorts)
+			port := AllocatePort(20100, 20300, mergePortMaps(meta.ExitVlessPorts, meta.ExitHy2Ports, meta.ExitSocksPorts))
 			meta.ExitVlessPorts[e.Name] = port
 			changed = true
 			log.Printf("[reconcile] assigned vless port %d for exit %s", port, e.Name)
 		}
 		if _, exists := meta.ExitHy2Ports[e.Name]; !exists {
-			port := AllocatePort(20300, 20500, meta.ExitHy2Ports)
+			port := AllocatePort(20500, 20700, mergePortMaps(meta.ExitHy2Ports, meta.ExitVlessPorts, meta.ExitSocksPorts))
 			meta.ExitHy2Ports[e.Name] = port
 			changed = true
 			log.Printf("[reconcile] assigned hy2 port %d for exit %s", port, e.Name)
@@ -1108,12 +1108,59 @@ func validateAndApplyConfig(newData []byte, logPrefix string) error {
 		return err
 	}
 
+	// Back up current config for potential rollback. Read before rename so we
+	// have the pre-change state even if sing-box is currently broken.
+	var prevConfig []byte
+	if prev, err := os.ReadFile(ConfigPath()); err == nil {
+		prevConfig = prev
+	}
+
 	// Atomic write: rename .tmp → config.json (crash-safe, no partial writes)
 	if err := os.Rename(tmpFile, ConfigPath()); err != nil {
 		return err
 	}
 
 	log.Printf("%s config updated, restarting sing-box", logPrefix)
+	if err := SystemctlOp("restart", "sing-box"); err != nil {
+		// restart command itself failed (systemctl error, not sing-box crash)
+		// — try rollback if we have a backup
+		rollbackConfig(logPrefix, prevConfig)
+		return err
+	}
+
+	// Post-restart liveness check: sing-box may crash-loop on the new config.
+	// systemd Restart=on-failure masks this — IsActive returns true briefly.
+	// Wait briefly then verify.
+	time.Sleep(3 * time.Second)
+	if !IsActive("sing-box") {
+		log.Printf("%s sing-box not active after restart, rolling back config", logPrefix)
+		if rbErr := rollbackConfig(logPrefix, prevConfig); rbErr != nil {
+			return fmt.Errorf("sing-box inactive after restart and rollback failed: %w", rbErr)
+		}
+		return fmt.Errorf("sing-box inactive after restart, config rolled back")
+	}
+
+	return nil
+}
+
+// rollbackConfig restores prevConfig to ConfigPath and restarts sing-box.
+// If prevConfig is nil (no backup), it only logs.
+// Uses atomic write (tmp+rename) to maintain crash-safety consistency with
+// validateAndApplyConfig.
+func rollbackConfig(logPrefix string, prevConfig []byte) error {
+	if prevConfig == nil {
+		log.Printf("%s no backup config to roll back to", logPrefix)
+		return nil
+	}
+	tmpFile := ConfigPath() + ".rollback.tmp"
+	if err := os.WriteFile(tmpFile, prevConfig, 0600); err != nil {
+		return fmt.Errorf("write rollback tmp: %w", err)
+	}
+	if err := os.Rename(tmpFile, ConfigPath()); err != nil {
+		os.Remove(tmpFile)
+		return fmt.Errorf("rename rollback: %w", err)
+	}
+	log.Printf("%s restored previous config, restarting sing-box", logPrefix)
 	return SystemctlOp("restart", "sing-box")
 }
 
@@ -1156,4 +1203,16 @@ func AllocatePort(min, max int, exclude map[string]int) int {
 		}
 	}
 	return GenerateRandomPort(min, max)
+}
+
+// mergePortMaps combines multiple port maps into a single exclude map so
+// AllocatePort avoids ports already assigned by any protocol.
+func mergePortMaps(maps ...map[string]int) map[string]int {
+	merged := map[string]int{}
+	for _, m := range maps {
+		for name, port := range m {
+			merged[name] = port
+		}
+	}
+	return merged
 }

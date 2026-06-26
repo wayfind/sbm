@@ -69,7 +69,7 @@ func GenerateRandomPort(min, max int, exclude ...int) int {
 	b := make([]byte, 2)
 	for i := 0; i < 10000; i++ {
 		rand.Read(b)
-		port := min + int(uint16(b[0])<<8|uint16(b[1]))%(max-min)
+		port := min + int(uint16(b[0])<<8|uint16(b[1]))%(max-min+1)
 		if !excl[port] {
 			return port
 		}

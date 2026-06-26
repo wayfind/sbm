@@ -382,14 +382,13 @@ func BuildEntryOutbounds(transits []TransitInfo, exits []ExitInfo) []interface{}
 		for i, e := range exits {
 			exitTags[i] = "exit-" + e.Name
 		}
-		// Daily sticky: pick one exit per day, rotate daily
-		// All AI traffic goes through the same exit IP for the entire day
-		defaultExit := stickyFirstExit(exitTags)
 		outbounds = append(outbounds, map[string]interface{}{
-			"type":      "selector",
+			"type":      "urltest",
 			"tag":       "residential",
 			"outbounds": exitTags,
-			"default":   defaultExit,
+			"url":       "https://www.gstatic.com/generate_204",
+			"interval":  "1m",
+			"tolerance": 200,
 		})
 	}
 
@@ -398,19 +397,6 @@ func BuildEntryOutbounds(transits []TransitInfo, exits []ExitInfo) []interface{}
 	)
 
 	return outbounds
-}
-
-// stickyFirstExit picks the first exit tag as the selector default.
-// When an exit goes offline, reconcile removes it from the list,
-// and the next available exit becomes the new default.
-func stickyFirstExit(exitTags []interface{}) string {
-	if len(exitTags) == 0 {
-		return ""
-	}
-	if s, ok := exitTags[0].(string); ok {
-		return s
-	}
-	return ""
 }
 
 // BuildEntryRoute builds the route section for an entry node config.

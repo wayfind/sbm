@@ -11,6 +11,8 @@ import (
 const singboxUnit = `[Unit]
 Description=sing-box service
 After=network.target
+StartLimitBurst=3
+StartLimitIntervalSec=60
 
 [Service]
 ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
