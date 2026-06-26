@@ -21,6 +21,7 @@ func openTestDB(t *testing.T) *sql.DB {
 			password   TEXT NOT NULL,
 			quota_gb   REAL DEFAULT 0,
 			enabled    INTEGER DEFAULT 1,
+			quota_disabled INTEGER DEFAULT 0,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		);
 		CREATE TABLE traffic (
@@ -213,6 +214,118 @@ func TestQuotaExceeded(t *testing.T) {
 	}
 }
 
+// quotaDisabledOf returns the quota_disabled flag for a user.
+func quotaDisabledOf(t *testing.T, db *sql.DB, name string) int {
+	t.Helper()
+	var qd int
+	if err := db.QueryRow("SELECT quota_disabled FROM users WHERE name = ?", name).Scan(&qd); err != nil {
+		t.Fatalf("read quota_disabled %s: %v", name, err)
+	}
+	return qd
+}
+
+// TestGlobalQuotaAggregation: local traffic alone is under quota, but local +
+// other-node (globalExtra) traffic exceeds it → user is quota-disabled.
+func TestGlobalQuotaAggregation(t *testing.T) {
+	db := openTestDB(t)
+	addTestUser(t, db, "alice", 0.002) // 2 MB quota
+
+	// Local: 1 MB (under quota on its own)
+	if err := RecordTraffic(db, "alice", 600_000, 400_000); err != nil {
+		t.Fatal(err)
+	}
+
+	// Without global extra → not disabled
+	disabled, err := CheckQuotas(db, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(disabled) != 0 {
+		t.Fatalf("local-only should be under quota, got disabled=%v", disabled)
+	}
+	if quotaDisabledOf(t, db, "alice") != 0 {
+		t.Fatalf("alice should not be quota-disabled by local traffic alone")
+	}
+
+	// With another node contributing 1.5 MB → global 2.5 MB ≥ 2 MB → disabled
+	disabled, err = CheckQuotas(db, map[string]int64{"alice": 1_500_000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(disabled) != 1 || disabled[0] != "alice" {
+		t.Fatalf("global total should exceed quota, got disabled=%v", disabled)
+	}
+	if quotaDisabledOf(t, db, "alice") != 1 {
+		t.Fatalf("alice should be quota-disabled after global aggregation")
+	}
+	// enabled flag must stay untouched (orthogonal to quota_disabled)
+	var enabled int
+	db.QueryRow("SELECT enabled FROM users WHERE name = 'alice'").Scan(&enabled)
+	if enabled != 1 {
+		t.Fatalf("quota disable must not touch enabled flag, got enabled=%d", enabled)
+	}
+}
+
+// TestMonthlyRollover: rollover clears quota_disabled but leaves manual disables.
+func TestMonthlyRollover(t *testing.T) {
+	db := openTestDB(t)
+	addTestUser(t, db, "alice", 1)
+	addTestUser(t, db, "bob", 1)
+
+	// alice quota-disabled, bob manually disabled
+	SetQuotaDisabled(db, "alice", true)
+	db.Exec("UPDATE users SET enabled = 0 WHERE name = 'bob'")
+
+	// Seed meta with a stale month so rollover fires.
+	db.Exec(`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)`)
+	db.Exec(`INSERT INTO meta (key, value) VALUES ('quota_month', '2000-01')`)
+
+	rolled, err := MonthlyRollover(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rolled {
+		t.Fatal("expected rollover to fire on stale month")
+	}
+	if quotaDisabledOf(t, db, "alice") != 0 {
+		t.Fatal("rollover should clear alice quota_disabled")
+	}
+	var bobEnabled int
+	db.QueryRow("SELECT enabled FROM users WHERE name = 'bob'").Scan(&bobEnabled)
+	if bobEnabled != 0 {
+		t.Fatal("rollover must NOT re-enable a manually-disabled user")
+	}
+
+	// Second call in the same month is a no-op.
+	rolled, _ = MonthlyRollover(db)
+	if rolled {
+		t.Fatal("rollover must not fire twice in the same month")
+	}
+}
+
+// TestGetEnabledUsersExcludesQuotaDisabled: served set excludes both manual and
+// quota disables.
+func TestGetEnabledUsersExcludesQuotaDisabled(t *testing.T) {
+	db := openTestDB(t)
+	addTestUser(t, db, "alice", 1)
+	addTestUser(t, db, "bob", 1)
+	addTestUser(t, db, "carol", 1)
+	SetQuotaDisabled(db, "bob", true)
+	db.Exec("UPDATE users SET enabled = 0 WHERE name = 'carol'")
+
+	users, err := GetEnabledUsers(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(users) != 1 || users[0].Name != "alice" {
+		names := []string{}
+		for _, u := range users {
+			names = append(names, u.Name)
+		}
+		t.Fatalf("expected only alice served, got %v", names)
+	}
+}
+
 // ── Test helpers ────────────────────────────────────────────────────────────
 
 // simulatePoll calls the delta logic directly (without gRPC) by injecting fake stats.
@@ -258,7 +371,7 @@ func simulatePoll(t *testing.T, db *sql.DB, current map[string]*V2RayUserTraffic
 		}
 	}
 
-	disabled, err := CheckQuotas(db)
+	disabled, err := CheckQuotas(db, nil)
 	if err != nil {
 		t.Fatalf("CheckQuotas: %v", err)
 	}

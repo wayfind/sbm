@@ -689,7 +689,7 @@ function renderUsers() {
     var u = usersData[i];
     var pct = 0;
     if (u.quota_gb > 0) {
-      pct = Math.min(100, Math.round((u.bytes_total || 0) / (u.quota_gb * 1073741824) * 100));
+      pct = Math.min(100, Math.round((u.bytes_total || 0) / (u.quota_gb * 1e9) * 100));
     }
     var pctClass = pct > 90 ? 'danger' : (pct > 70 ? 'warn' : '');
     rows += '<tr class="' + (u.enabled ? '' : 'disabled-row') + '">';
@@ -878,8 +878,16 @@ setInterval(loadUsers, 30000);
 
 // --- Helper: find entry node from TOPO_KV ---
 async function findEntryNode(env) {
+  const bases = await allEntryBases(env);
+  return bases.length ? bases[0] : null;
+}
+
+// allEntryBases returns the base URL of every alive, non-stale entry node.
+async function allEntryBases(env) {
   const list = await env.TOPO_KV.list();
+  const bases = [];
   for (const key of list.keys) {
+    if (key.name.startsWith('user/') || key.name.startsWith('usage/')) continue;
     const val = await env.TOPO_KV.get(key.name);
     if (!val) continue;
     try {
@@ -888,11 +896,42 @@ async function findEntryNode(env) {
         const ageMs = Date.now() - new Date(node.reported_at).getTime();
         if (ageMs > 20 * 60 * 1000) continue; // skip stale
         const port = node.sub_port || 20033;
-        return `https://${node.domain}:${port}`;
+        bases.push(`https://${node.domain}:${port}`);
       }
     } catch {}
   }
-  return null;
+  return bases;
+}
+
+// fanOutToEntries broadcasts a write (PUT/POST/DELETE) to ALL entry nodes, so
+// per-entry local state (enabled, quota_disabled, traffic) stays consistent
+// across the cluster. Returns the last node's parsed JSON (all nodes get the
+// same mutation, so any response body is representative). Errors on individual
+// nodes are collected but do not abort the others.
+async function fanOutToEntries(env, method, path, apiKey, bodyText) {
+  const bases = await allEntryBases(env);
+  if (!bases.length) {
+    return { ok: false, status: 502, body: { error: 'no entry node available' } };
+  }
+  let lastBody = { status: 'ok' };
+  let anyOk = false;
+  const errors = [];
+  for (const base of bases) {
+    try {
+      const headers = { 'Authorization': 'Bearer ' + apiKey };
+      if (bodyText) headers['Content-Type'] = 'application/json';
+      const resp = await fetch(base + path, { method, headers, body: bodyText || undefined });
+      if (resp.ok) {
+        anyOk = true;
+        try { lastBody = await resp.json(); } catch {}
+      } else {
+        errors.push(`${base}:${resp.status}`);
+      }
+    } catch (e) {
+      errors.push(`${base}:${String(e)}`);
+    }
+  }
+  return { ok: anyOk, status: anyOk ? 200 : 502, body: lastBody, errors };
 }
 
 // --- Helper: proxy request to entry node ---
@@ -975,12 +1014,12 @@ export default {
       return Response.json({ status: 'ok' });
     }
 
-    // GET /nodes — list all (skip user/* keys)
+    // GET /nodes — list all (skip user/* and usage/* keys)
     if (request.method === 'GET' && path === '/nodes') {
       const list = await env.TOPO_KV.list();
       const nodes = [];
       for (const key of list.keys) {
-        if (key.name.startsWith('user/')) continue;
+        if (key.name.startsWith('user/') || key.name.startsWith('usage/')) continue;
         const val = await env.TOPO_KV.get(key.name);
         if (val) {
           try { nodes.push(JSON.parse(val)); } catch {}
@@ -989,11 +1028,125 @@ export default {
       return Response.json(nodes);
     }
 
+    // PUT /usage/:node_id — per-entry per-user monthly traffic (for global quota).
+    // No short TTL: usage is a cumulative counter, not a heartbeat. Binding it to
+    // the 30min node TTL would drop a node's share on any reporting gap and
+    // under-count the global total. 35-day TTL just garbage-collects stale months.
+    if (request.method === 'PUT' && path.startsWith('/usage/')) {
+      const id = path.slice(7);
+      if (!id) return Response.json({ error: 'missing id' }, { status: 400 });
+      const body = await request.text();
+      try { JSON.parse(body); } catch {
+        return Response.json({ error: 'invalid json' }, { status: 400 });
+      }
+      await env.TOPO_KV.put('usage/' + id, body, { expirationTtl: 35 * 24 * 3600 });
+      return Response.json({ status: 'ok' });
+    }
+
+    // GET /api/usage — list all per-node usage blobs (raw, for debugging/aggregation)
+    if (request.method === 'GET' && path === '/api/usage') {
+      const list = await env.TOPO_KV.list({ prefix: 'usage/' });
+      const out = [];
+      for (const key of list.keys) {
+        const val = await env.TOPO_KV.get(key.name);
+        if (val) {
+          try { out.push(JSON.parse(val)); } catch {}
+        }
+      }
+      return Response.json(out);
+    }
+
+    // DELETE /usage/:node_id — drop a node's usage blob (cleanup of decommissioned nodes)
+    if (request.method === 'DELETE' && path.startsWith('/usage/')) {
+      const id = path.slice(7);
+      if (!id) return Response.json({ error: 'missing id' }, { status: 400 });
+      await env.TOPO_KV.delete('usage/' + id);
+      return Response.json({ status: 'ok' });
+    }
+
     // DELETE /nodes/:id
     if (request.method === 'DELETE' && path.startsWith('/nodes/')) {
       const id = path.slice(7);
       await env.TOPO_KV.delete(id);
       return Response.json({ status: 'ok' });
+    }
+
+    // --- Aggregated user view for dashboard ---
+    // GET /api/users — list all users with GLOBALLY aggregated traffic.
+    // Must come BEFORE the /api/ proxy fall-through below, otherwise it would be
+    // forwarded to a single entry node and only show that node's local traffic
+    // (the multi-entry aggregation bug). Sums usage/* keys (current month only)
+    // across all entry nodes to produce each user's global bytes_total.
+    if (request.method === 'GET' && path === '/api/users') {
+      // Current month UTC as YYYY-MM (matches Go CurrentMonth()).
+      const now = new Date();
+      const month = now.getUTCFullYear() + '-' + String(now.getUTCMonth() + 1).padStart(2, '0');
+
+      // Sum per-user bytes across all nodes for the current month.
+      const totals = {}; // name -> bytes_total
+      const usageList = await env.TOPO_KV.list({ prefix: 'usage/' });
+      for (const key of usageList.keys) {
+        const val = await env.TOPO_KV.get(key.name);
+        if (!val) continue;
+        try {
+          const nu = JSON.parse(val);
+          if (nu.month !== month || !nu.users) continue; // skip stale months
+          for (const name in nu.users) {
+            const b = nu.users[name] || {};
+            totals[name] = (totals[name] || 0) + (b.up || 0) + (b.down || 0);
+          }
+        } catch {}
+      }
+
+      // Collect entry sub-URL bases (host:port) to build per-user subscription
+      // links, mirroring the entry-side buildSubURLs (host = public_host||domain,
+      // port = sub_port||20033). Built here so links survive any single entry
+      // being offline, and so this aggregated handler keeps the per-entry sub
+      // links the old single-node proxy used to return.
+      const subBases = []; // [{host, port}]
+      const nodeList = await env.TOPO_KV.list();
+      for (const key of nodeList.keys) {
+        if (key.name.startsWith('user/') || key.name.startsWith('usage/')) continue;
+        const val = await env.TOPO_KV.get(key.name);
+        if (!val) continue;
+        try {
+          const n = JSON.parse(val);
+          if (n.role !== 'entry') continue;
+          const host = n.public_host || n.domain;
+          if (!host) continue;
+          subBases.push({ host: host, port: n.sub_port || 20033 });
+        } catch {}
+      }
+      subBases.sort((a, b) => (a.host + a.port).localeCompare(b.host + b.port));
+
+      const userList = await env.TOPO_KV.list({ prefix: 'user/' });
+      const users = [];
+      for (const key of userList.keys) {
+        const val = await env.TOPO_KV.get(key.name);
+        if (!val) continue;
+        try {
+          const u = JSON.parse(val);
+          const name = key.name.slice(5); // strip "user/" prefix
+          const bytesTotal = totals[name] || 0;
+          const quotaGB = u.quota_gb || 0;
+          const subUrls = subBases.map(function (b) {
+            return 'https://' + b.host + ':' + b.port + '/sub/' + name;
+          });
+          users.push({
+            name: name,
+            uuid: u.uuid,
+            password: u.password,
+            quota_gb: quotaGB,
+            bytes_total: bytesTotal,
+            sub_urls: subUrls,
+            // Quota-view enabled: false when global usage meets/exceeds quota.
+            // Manual disables aren't visible to the Worker; dashboard shows quota state.
+            enabled: !(quotaGB > 0 && bytesTotal >= quotaGB * 1e9),
+          });
+        } catch {}
+      }
+      users.sort((a, b) => a.name.localeCompare(b.name));
+      return Response.json(users);
     }
 
     // --- CF User registry (source of truth) ---
@@ -1043,6 +1196,16 @@ export default {
 
     // --- API proxy to entry node ---
     if (path.startsWith('/api/')) {
+      // Writes to per-user state (enable/disable, reset) must hit EVERY entry so
+      // local state stays consistent — otherwise a single-node proxy leaves the
+      // user enabled on some nodes and disabled on others. GETs and other /api/
+      // calls still proxy to one node.
+      const isUserWrite = path.startsWith('/api/users/') && request.method !== 'GET';
+      if (isUserWrite) {
+        const bodyText = request.method !== 'HEAD' ? await request.text() : '';
+        const res = await fanOutToEntries(env, request.method, path, given, bodyText);
+        return Response.json(res.body, { status: res.status });
+      }
       const entryBase = await findEntryNode(env);
       if (!entryBase) {
         return Response.json({ error: 'no entry node available' }, { status: 502 });

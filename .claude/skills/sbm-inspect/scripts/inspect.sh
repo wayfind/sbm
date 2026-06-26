@@ -88,8 +88,6 @@ free -m 2>/dev/null | awk '/Mem:/ {print int(\$3/\$2*100)}' | tr -d '\n' | emit 
 free -m 2>/dev/null | awk '/Swap:/ {print \$3}' | tr -d '\n' | emit SWAPUSED_MB
 # 配置文件新鲜度（最后修改时间戳）
 stat -c %Y /etc/sing-box/config.json 2>/dev/null | tr -d '\n' | emit CONFIG_MTIME
-# sbm-server 日志新鲜度（最后一条日志的时间戳，检测 goroutine 卡死）
-${sudo_prefix}journalctl -u sbm-server --no-pager 2>/dev/null | tail -1 | awk '{print \$1, \$2, \$3}' | tr -d '\n' | emit SBMLASTLOG
 echo DONE
 REMOTE
 }
@@ -245,9 +243,6 @@ for name in sorted(node_names):
     try: row['config_mtime'] = int(kv.get('CONFIG_MTIME', '0').strip())
     except: row['config_mtime'] = 0
 
-    # sbm-server 日志新鲜度（检测 goroutine 卡死）
-    row['sbm_lastlog'] = kv.get('SBMLASTLOG', '').strip()
-
     rows.append(row)
 
     # 异常累积
@@ -297,27 +292,9 @@ for name in sorted(node_names):
         issues.append(f"**{name}**: 内存使用 {row['mem_pct']}%（≥ 90%）")
     if row['swap_used_mb'] > 500:
         issues.append(f"**{name}**: Swap 使用 {row['swap_used_mb']}MB（> 500MB，内存压力）")
-    # sbm-server 日志停滞（goroutine 卡死检测）
-    if row['sbm_lastlog']:
-        try:
-            # journalctl 日志格式: "Jun 25 10:00:00 hostname ..."
-            # 解析相对时间差
-            import re
-            now = datetime.datetime.now()
-            # 尝试解析 journalctl 默认格式
-            m = re.match(r'(\w{3})\s+(\d+)\s+(\d{2}):(\d{2}):(\d{2})', row['sbm_lastlog'])
-            if m:
-                month_str, day, hh, mm, ss = m.groups()
-                months = {'Jan':1,'Feb':2,'Mar':3,'Apr':4,'May':5,'Jun':6,'Jul':7,'Aug':8,'Sep':9,'Oct':10,'Nov':11,'Dec':12}
-                mon = months.get(month_str, 1)
-                log_time = datetime.datetime(now.year, mon, int(day), int(hh), int(mm), int(ss))
-                # 处理跨年
-                if log_time > now + datetime.timedelta(days=1):
-                    log_time = log_time.replace(year=now.year - 1)
-                age_min = (now - log_time).total_seconds() / 60
-                if age_min > 10:
-                    issues.append(f"**{name}**: sbm-server 最后一条日志在 {int(age_min)}min 前（疑似 goroutine 卡死）")
-        except: pass
+    # 注意: 不用"日志时间差"判 sbm-server 卡死 —— sbm-server 正常运行时静默不打日志,
+    # 10min 无日志是常态,会让所有健康节点全部误报。reporter goroutine 卡死的正确判据是
+    # CF 上报新鲜度(下方 reported_at > 6min / alive=false),那才是 reporter 停了的真实信号。
 
 # --- 节点健康表 ---
 print("# sbm 全节点巡检报告\n")

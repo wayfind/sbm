@@ -68,7 +68,38 @@ func OpenUsersDB() (*sql.DB, error) {
 		return nil, fmt.Errorf("create tables: %w", err)
 	}
 
+	// Migration: quota_disabled separates auto quota-disable from manual enabled.
+	// A user is served only when enabled=1 AND quota_disabled=0. Idempotent.
+	if !columnExists(db, "users", "quota_disabled") {
+		if _, err := db.Exec(`ALTER TABLE users ADD COLUMN quota_disabled INTEGER DEFAULT 0`); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("migrate quota_disabled: %w", err)
+		}
+	}
+
 	return db, nil
+}
+
+// columnExists reports whether a column is present on a table (for idempotent migrations).
+func columnExists(db *sql.DB, table, column string) bool {
+	rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			continue
+		}
+		if name == column {
+			return true
+		}
+	}
+	return false
 }
 
 func CurrentMonth() string {
@@ -168,7 +199,7 @@ func GetUser(db *sql.DB, name string) (*UserWithTraffic, error) {
 
 // GetEnabledUsers returns only enabled users (for config generation).
 func GetEnabledUsers(db *sql.DB) ([]User, error) {
-	rows, err := db.Query("SELECT name, uuid, password, quota_gb, enabled, created_at FROM users WHERE enabled = 1 ORDER BY name")
+	rows, err := db.Query("SELECT name, uuid, password, quota_gb, enabled, created_at FROM users WHERE enabled = 1 AND quota_disabled = 0 ORDER BY name")
 	if err != nil {
 		return nil, err
 	}
@@ -229,6 +260,27 @@ func RecordTraffic(db *sql.DB, name string, bytesUp, bytesDown int64) error {
 	return err
 }
 
+// GetMonthUsage returns every user's traffic (up/down) for the given month,
+// keyed by user name. Used to build this node's CF usage report.
+func GetMonthUsage(db *sql.DB, month string) (map[string]UsageBytes, error) {
+	rows, err := db.Query(
+		"SELECT user_name, bytes_up, bytes_down FROM traffic WHERE month = ?", month)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]UsageBytes)
+	for rows.Next() {
+		var name string
+		var up, down int64
+		if err := rows.Scan(&name, &up, &down); err != nil {
+			return nil, err
+		}
+		out[name] = UsageBytes{Up: up, Down: down}
+	}
+	return out, rows.Err()
+}
+
 // ResetUserTraffic resets the current month's traffic for a user.
 func ResetUserTraffic(db *sql.DB, name string) error {
 	month := CurrentMonth()
@@ -279,14 +331,19 @@ func EnsureDefaultUser(db *sql.DB, meta *Metadata) error {
 	return nil
 }
 
-// CheckQuotas checks all users and disables those over quota. Returns names of newly disabled users.
-func CheckQuotas(db *sql.DB) ([]string, error) {
+// CheckQuotas disables users whose GLOBAL traffic (this node + all other entry
+// nodes, passed in via globalExtra keyed by user name) meets or exceeds their
+// quota. globalExtra holds OTHER nodes' bytes for the current month; this node's
+// own bytes are read from the local traffic table. A quota hit sets
+// quota_disabled=1 (NOT enabled — manual enable/disable stays orthogonal).
+// Returns names of users newly quota-disabled by this call.
+func CheckQuotas(db *sql.DB, globalExtra map[string]int64) ([]string, error) {
 	month := CurrentMonth()
 	rows, err := db.Query(`
 		SELECT u.name, u.quota_gb, COALESCE(t.bytes_up, 0) + COALESCE(t.bytes_down, 0) as total
 		FROM users u
 		LEFT JOIN traffic t ON u.name = t.user_name AND t.month = ?
-		WHERE u.enabled = 1 AND u.quota_gb > 0
+		WHERE u.enabled = 1 AND u.quota_disabled = 0 AND u.quota_gb > 0
 	`, month)
 	if err != nil {
 		return nil, err
@@ -297,10 +354,11 @@ func CheckQuotas(db *sql.DB) ([]string, error) {
 	for rows.Next() {
 		var name string
 		var quotaGB float64
-		var totalBytes int64
-		if err := rows.Scan(&name, &quotaGB, &totalBytes); err != nil {
+		var localBytes int64
+		if err := rows.Scan(&name, &quotaGB, &localBytes); err != nil {
 			continue
 		}
+		totalBytes := localBytes + globalExtra[name]
 		quotaBytes := int64(quotaGB * 1e9)
 		if totalBytes >= quotaBytes {
 			overQuota = append(overQuota, name)
@@ -311,11 +369,50 @@ func CheckQuotas(db *sql.DB) ([]string, error) {
 	// Now disable (rows closed, no read lock held)
 	var disabled []string
 	for _, name := range overQuota {
-		if err := SetUserEnabled(db, name, false); err != nil {
-			log.Printf("[quota] failed to disable %s: %v", name, err)
+		if err := SetQuotaDisabled(db, name, true); err != nil {
+			log.Printf("[quota] failed to quota-disable %s: %v", name, err)
 			continue
 		}
 		disabled = append(disabled, name)
 	}
 	return disabled, nil
+}
+
+// SetQuotaDisabled sets the quota_disabled flag (auto quota enforcement),
+// independent of the manual enabled flag.
+func SetQuotaDisabled(db *sql.DB, name string, disabled bool) error {
+	val := 0
+	if disabled {
+		val = 1
+	}
+	_, err := db.Exec("UPDATE users SET quota_disabled = ? WHERE name = ?", val, name)
+	return err
+}
+
+// MonthlyRollover clears quota_disabled for all users when the processed month
+// changes, so quota-disabled users are automatically restored at the start of a
+// new month. Manual disables (enabled=0) are untouched. Idempotent: the meta row
+// records the last processed month so this runs at most once per month.
+// Returns true if a rollover happened.
+func MonthlyRollover(db *sql.DB) (bool, error) {
+	db.Exec(`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)`)
+	month := CurrentMonth()
+	var last string
+	db.QueryRow(`SELECT value FROM meta WHERE key = 'quota_month'`).Scan(&last)
+	if last == month {
+		return false, nil
+	}
+	if _, err := db.Exec(`UPDATE users SET quota_disabled = 0`); err != nil {
+		return false, err
+	}
+	_, err := db.Exec(
+		`INSERT INTO meta (key, value) VALUES ('quota_month', ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`, month)
+	if err != nil {
+		return false, err
+	}
+	if last != "" {
+		log.Printf("[quota] monthly rollover %s→%s: cleared quota_disabled", last, month)
+	}
+	return true, nil
 }

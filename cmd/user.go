@@ -185,8 +185,11 @@ func userReset(db *sql.DB, args []string) error {
 	if err := internal.ResetUserTraffic(db, args[0]); err != nil {
 		return err
 	}
-	// Re-enable if was disabled by quota
+	// Drop in-memory baseline and clear BOTH disable flags (manual + quota),
+	// matching the HTTP reset endpoint so reset behaves identically either way.
+	internal.ResetTrackerUser(args[0])
 	internal.SetUserEnabled(db, args[0], true)
+	internal.SetQuotaDisabled(db, args[0], false)
 	if internal.JSONMode {
 		internal.PrintJSON(map[string]string{"name": args[0], "status": "reset"})
 	} else {

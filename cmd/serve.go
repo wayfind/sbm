@@ -91,7 +91,7 @@ func RunServe(args []string) error {
 
 	// Traffic collector + quota enforcement (entry only)
 	if meta.Role == internal.RoleEntry && usersDB != nil {
-		internal.StartTrafficCollector(usersDB, 30*time.Second, func(disabled []string) {
+		internal.StartTrafficCollector(usersDB, cfClient, meta.NodeID, 30*time.Second, func(disabled []string) {
 			log.Printf("[traffic] quota exceeded, disabling users %v → reconcile now", disabled)
 			// Trigger immediate reconcile: rebuild config without disabled users + restart sing-box
 			downstreams := topoStore.GetDownstreams()
@@ -370,6 +370,10 @@ func makeAPIUsersRouter(db *sql.DB, meta *internal.Metadata, cfClient *internal.
 					jsonError(w, err.Error(), 400)
 					return
 				}
+				// Manual enable is an explicit admin override of an auto quota-disable.
+				if *req.Enabled {
+					internal.SetQuotaDisabled(db, name, false)
+				}
 			}
 			user, err := internal.GetUser(db, name)
 			if err != nil {
@@ -384,8 +388,19 @@ func makeAPIUsersRouter(db *sql.DB, meta *internal.Metadata, cfClient *internal.
 				jsonError(w, err.Error(), 400)
 				return
 			}
-			// Also re-enable user after reset
+			// Drop in-memory baseline so the next poll restarts cleanly.
+			internal.ResetTrackerUser(name)
+			// Also re-enable user after reset (clear both manual and quota disable)
 			internal.SetUserEnabled(db, name, true)
+			internal.SetQuotaDisabled(db, name, false)
+			// Immediately re-report this node's usage so the CF aggregate drops
+			// this user's old bytes right away (don't wait for the next poll).
+			if cfClient != nil {
+				month := internal.CurrentMonth()
+				if usage, uErr := internal.GetMonthUsage(db, month); uErr == nil {
+					cfClient.ReportUsage(meta.NodeID, month, usage)
+				}
+			}
 			user, err := internal.GetUser(db, name)
 			if err != nil {
 				jsonError(w, err.Error(), 404)
