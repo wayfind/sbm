@@ -291,6 +291,9 @@ func makeAPIUsersRouter(db *sql.DB, meta *internal.Metadata, cfClient *internal.
 						port = 20033
 					}
 					urls = append(urls, fmt.Sprintf("https://%s:%d/sub/%s", host, port, username))
+					if n.HTTPSubPort > 0 {
+						urls = append(urls, fmt.Sprintf("http://%s:%d/sub/%s", host, n.HTTPSubPort, username))
+					}
 				}
 			}
 		}

@@ -1183,11 +1183,11 @@ export default {
         } catch {}
       }
 
-      // Entry sub-URL bases (host:port), mirroring entry-side buildSubURLs
-      // (host = public_host||domain, port = sub_port||20033). Built here so links
-      // survive any single entry being offline and the aggregated handler keeps
-      // the per-entry sub links the old single-node proxy used to return.
-      const subBases = []; // [{host, port}]
+      // Entry sub-URL bases, mirroring entry-side buildSubURLs. Every entry has
+      // an HTTPS subscription URL and may also expose a plaintext HTTP fallback
+      // through http_sub_port (used by IP-only/NAT'd nodes with mismatched TLS
+      // certificates). Built here so links survive any single entry being offline.
+      const subBases = []; // [{scheme, host, port}]
       for (const val of nodeVals) {
         if (!val) continue;
         try {
@@ -1195,10 +1195,18 @@ export default {
           if (n.role !== 'entry') continue;
           const host = n.public_host || n.domain;
           if (!host) continue;
-          subBases.push({ host: host, port: n.sub_port || 20033 });
+          subBases.push({ scheme: 'https', host: host, port: n.sub_port || 20033 });
+          if (n.http_sub_port) {
+            subBases.push({ scheme: 'http', host: host, port: n.http_sub_port });
+          }
         } catch {}
       }
-      subBases.sort((a, b) => a.host.localeCompare(b.host));
+      subBases.sort((a, b) => {
+        const hostOrder = a.host.localeCompare(b.host);
+        if (hostOrder !== 0) return hostOrder;
+        if (a.scheme !== b.scheme) return a.scheme === 'https' ? -1 : 1;
+        return a.port - b.port;
+      });
 
       const users = [];
       for (let i = 0; i < userKeys.length; i++) {
@@ -1210,7 +1218,7 @@ export default {
           const bytesTotal = totals[name] || 0;
           const quotaGB = u.quota_gb || 0;
           const subUrls = subBases.map(function (b) {
-            return 'https://' + b.host + ':' + b.port + '/sub/' + name;
+            return b.scheme + '://' + b.host + ':' + b.port + '/sub/' + name;
           });
           users.push({
             name: name,
